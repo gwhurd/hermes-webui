@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Documentation
+
+- **PR #2483** by @franksong2702 (refs #2364) — Add a narrow README note for the community ARM64 Android AVF field report: Hermes Agent + WebUI running inside a Debian 12 VM on a mid-range Android phone with cloud-hosted inference. The note frames the report as a compatibility signal rather than an official support baseline or provider/model benchmark, and records practical mobile caveats around first-install compile time, Android tab reloads, and battery optimization.
+
+
 ## [v0.51.86] — 2026-05-17 — Release BJ (stage-379 — 4-PR review-bypass batch — memory-provider session lifecycle + cross-provider /model alias + RuntimeAdapter cancel seam + Fork-from-here messaging coord)
 
 ### Fixed

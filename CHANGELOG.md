@@ -3,6 +3,8 @@
 
 ## [Unreleased]
 
+## [v0.51.134] — 2026-05-25 — Release DF (stage-batch16 — single-PR Windows path defaults)
+
 ### Fixed
 
 - **PR #2897** by @chouzz — On Windows, WebUI default state and config paths now align with Hermes Agent's `%LOCALAPPDATA%\hermes` convention instead of `%USERPROFILE%\.hermes`, so a fresh Windows install finds the same `~/.hermes/config.yaml` / `auth.json` / `webui/` state directory that the Hermes Agent created. POSIX behavior is unchanged (`~/.hermes` remains the default). `HERMES_HOME` and `HERMES_WEBUI_STATE_DIR` env overrides take precedence on both platforms. Closes #2840.

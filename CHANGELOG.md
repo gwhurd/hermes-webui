@@ -3,6 +3,8 @@
 
 ## [Unreleased]
 
+## [v0.51.137] — 2026-05-25 — Release DI (stage-batch19 — 6-PR medium-risk batch)
+
 ### Added
 
 - Operators can now set `HERMES_WEBUI_CSP_CONNECT_EXTRA` to append validated extra origins to the report-only CSP `connect-src` directive for reverse-proxy or tunnel deployments.

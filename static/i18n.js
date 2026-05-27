@@ -2067,6 +2067,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'Nessun dato di utilizzo skill ancora',
     insights_skill_usage_no_data_hint: 'Le skill appariranno qui dopo essere state usate nelle conversazioni.',
     insights_skill_usage_footer: 'Conteggi da ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Abilità',
+    insights_skill_usage_col_uses: 'Usi',
+    insights_skill_usage_col_views: 'Visualizzazioni',
+    insights_skill_usage_col_share: 'Utilizzo %',
+    insights_skill_usage_col_patches: 'Patch',
     workspace_desc: 'Aggiungi e cambia workspace per le tue sessioni.',
     session_meta_messages: (n) => `${n} msg`,
     session_meta_children: (n) => `${n} figli${n === 1 ? 'o' : ''}`,
@@ -3350,6 +3355,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'スキル使用データがまだありません',
     insights_skill_usage_no_data_hint: '会話でスキルを使用すると、ここに表示されます。',
     insights_skill_usage_footer: 'データ元: ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'スキル',
+    insights_skill_usage_col_uses: '使用回数',
+    insights_skill_usage_col_views: '閲覧数',
+    insights_skill_usage_col_share: '使用率',
+    insights_skill_usage_col_patches: 'パッチ',
     workspace_desc: 'セッション用のワークスペースを追加・切り替えします。',
     session_meta_messages: (n) => `${n} 件`,
     session_meta_children: (n) => `${n} 子`,
@@ -5061,6 +5071,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
     insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
     insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -6265,6 +6280,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
     insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
     insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -7484,6 +7504,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
     insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
     insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -8696,6 +8721,11 @@ const LOCALES = {
     insights_skill_usage_no_data: '暂无技能使用数据',
     insights_skill_usage_no_data_hint: '在对话中使用技能后，数据将在此显示。',
     insights_skill_usage_footer: '数据来源于 ~/.hermes/skills/',
+    insights_skill_usage_col_skill: '技能',
+    insights_skill_usage_col_uses: '使用次数',
+    insights_skill_usage_col_views: '查看次数',
+    insights_skill_usage_col_share: '使用占比',
+    insights_skill_usage_col_patches: '补丁',
     insights_input_tokens: '输入',
     insights_messages: '消息',
     insights_models: '模型',
@@ -9989,6 +10019,11 @@ const LOCALES = {
     insights_skill_usage_no_data: '暫無技能使用數據',
     insights_skill_usage_no_data_hint: '在會話中使用技能後，數據將在此顯示。',
     insights_skill_usage_footer: '數據來源於 ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -11083,6 +11118,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
     insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
     insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -12354,6 +12394,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
     insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
     insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Input',  // TODO: translate
     insights_messages: 'Messages',  // TODO: translate
     insights_models: 'Models',  // TODO: translate
@@ -13019,6 +13064,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'Aucune donnée d\'utilisation des skills pour le moment',
     insights_skill_usage_no_data_hint: 'Les skills apparaîtront ici une fois utilisés dans les conversations.',
     insights_skill_usage_footer: 'Comptages depuis ~/.hermes/skills/',
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     workspace_desc: 'Ajoutez et changez d\'espace de travail pour vos sessions.',
     session_lineage_segment_untitled: 'Segment sans titre',
     session_lineage_segment_open: 'Segment de lignée ouverte',
@@ -14843,6 +14893,11 @@ const LOCALES = {
     insights_skill_usage_no_data: 'No skill usage data yet',  // TODO: translate
     insights_skill_usage_no_data_hint: 'Skills will appear here once used in conversations.',  // TODO: translate
     insights_skill_usage_footer: 'Counts from ~/.hermes/skills/',  // TODO: translate
+    insights_skill_usage_col_skill: 'Skill',  // TODO: translate
+    insights_skill_usage_col_uses: 'Uses',  // TODO: translate
+    insights_skill_usage_col_views: 'Views',  // TODO: translate
+    insights_skill_usage_col_share: 'Usage %',  // TODO: translate
+    insights_skill_usage_col_patches: 'Patches',  // TODO: translate
     insights_input_tokens: 'Giriş',
     insights_messages: 'Mesajlar',
     insights_models: 'Modeller',

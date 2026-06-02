@@ -8273,7 +8273,7 @@ def _handle_tts(handler, parsed):
             import edge_tts
         except ImportError:
             from api.helpers import bad as _bad
-            return _bad(handler, "edge-tts not installed — see docs", 503)
+            return _bad(handler, "Edge TTS engine not installed on the server. Install it with: pip install edge-tts", 503)
 
         kwargs = {}
         if rate_str:

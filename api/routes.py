@@ -3494,6 +3494,94 @@ def _llm_wiki_page_files(wiki_path: Path) -> list[Path]:
     return pages
 
 
+def _llm_wiki_last_writer(wiki_path: Path, page_files: list[Path]) -> str:
+    """Best-effort last-writer detection for the LLM Wiki status card.
+
+    Closes the gap left by the original panel (commit 2684d6fa, Issue #1257):
+    the field was reserved as ``"last_writer": None`` with no reader wired up,
+    so the UI always rendered "Not available". This helper makes the field
+    useful without breaking the private-safe contract (reads only one line
+    of frontmatter and one line of log.md headings, never page bodies).
+
+    Priority:
+      1. Most-recently-modified page frontmatter ``updated_by`` / ``writer`` /
+         ``author`` (case-insensitive).
+      2. Most recent ``log.md`` heading of the form
+         ``## [YYYY-MM-DD] <action> | subject`` — returns
+         ``"ai-agent (<action>)"`` so the user can see ingest vs update.
+      3. Static fallback ``"ai-agent"`` so the UI never shows "Not available"
+         for a configured wiki.
+    """
+    # #3455 review (Codex): resolve the wiki root once and require every file we
+    # read to stay under it, so a symlinked .md page can't leak frontmatter from
+    # outside the wiki. Also read bounded line-by-line (frontmatter only / log
+    # headings only), never full page bodies, per the private-safe status contract.
+    try:
+        wiki_root = wiki_path.resolve()
+    except Exception:
+        wiki_root = wiki_path
+
+    def _within_wiki(p: Path) -> bool:
+        try:
+            return p.resolve().is_relative_to(wiki_root)
+        except Exception:
+            return False
+
+    # Priority 1: most recent page frontmatter (resolved-path must stay in-wiki)
+    latest_page: Path | None = None
+    latest_mtime = -1.0
+    for candidate in page_files:
+        if not _within_wiki(candidate):
+            continue  # skip symlinks resolving outside the wiki
+        try:
+            mtime = candidate.stat().st_mtime
+        except Exception:
+            continue
+        if mtime > latest_mtime:
+            latest_mtime = mtime
+            latest_page = candidate
+    if latest_page is not None:
+        try:
+            with open(latest_page, encoding="utf-8", errors="replace") as fh:
+                first = fh.readline()
+                if first.strip() == "---":
+                    # Read only the frontmatter block, bounded to a small line cap.
+                    for _ in range(200):
+                        line = fh.readline()
+                        if line == "" or line.strip() == "---":
+                            break  # EOF or end of frontmatter — never touch the body
+                        stripped = line.strip()
+                        lower = stripped.lower()
+                        for key in ("updated_by", "writer", "author"):
+                            if lower.startswith(f"{key}:"):
+                                value = stripped.split(":", 1)[1].strip()
+                                if value:
+                                    return value
+        except Exception:
+            pass
+
+    # Priority 2: log.md last entry action verb (heading lines only, bounded)
+    log_path = wiki_path / "log.md"
+    if _within_wiki(log_path) and log_path.is_file():
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                for _ in range(5000):  # cap the heading scan
+                    line = fh.readline()
+                    if line == "":
+                        break
+                    stripped = line.strip()
+                    if not stripped.startswith("## [") or "|" not in stripped:
+                        continue
+                    tail = stripped.split("]", 1)[1].strip() if "]" in stripped else ""
+                    action = tail.split()[0] if tail else "update"
+                    return f"ai-agent ({action})"
+        except Exception:
+            pass
+
+    # Priority 3: never return None / "Not available" for a configured wiki
+    return "ai-agent"
+
+
 def _build_llm_wiki_status() -> dict:
     """Return private-safe LLM Wiki status metadata without reading page bodies."""
     try:
@@ -3506,7 +3594,7 @@ def _build_llm_wiki_status() -> dict:
             "page_count": 0,
             "raw_source_count": 0,
             "last_updated": None,
-            "last_writer": None,
+            "last_writer": "ai-agent",
             "path_configured": path_configured,
             "path_source": path_source,
             "toggle_available": False,
@@ -3538,6 +3626,7 @@ def _build_llm_wiki_status() -> dict:
             "page_count": len(page_files),
             "raw_source_count": _llm_wiki_count_files(wiki_path / "raw"),
             "last_updated": _llm_wiki_safe_iso(latest),
+            "last_writer": _llm_wiki_last_writer(wiki_path, page_files),
         })
         return base
     except Exception as exc:
@@ -3549,7 +3638,7 @@ def _build_llm_wiki_status() -> dict:
             "page_count": 0,
             "raw_source_count": 0,
             "last_updated": None,
-            "last_writer": None,
+            "last_writer": "ai-agent",
             "path_configured": False,
             "path_source": "unknown",
             "toggle_available": False,

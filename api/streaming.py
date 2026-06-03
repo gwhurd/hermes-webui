@@ -1303,6 +1303,49 @@ def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachme
     return parts if image_count else workspace_ctx + msg_text
 
 
+def _split_thinking_from_content(raw_content, existing_reasoning=''):
+    """Split a single LEADING <think> block out of assistant content.
+
+    Server-side twin of the JS ``_splitThinkFromContent`` (static/messages.js).
+    Inline-thinking providers (e.g. MiniMax-M3, OpenAI-compat) leave the thinking
+    trace inside the saved ``m['content']``, bloating session files 30-50% and
+    bypassing the ``m['reasoning']`` field the thinking card reads on reload
+    (#3455). This extracts exactly ONE leading block (after lstrip) — matching the
+    live renderer's _streamDisplay/_parseStreamState semantics — so a closed
+    ``<think>...</think>`` that appears MID-BODY (e.g. a literal tag in a fenced
+    code block) stays visible content and is never moved into reasoning, and a
+    partial/unclosed block is left intact.
+
+    Returns ``(content, reasoning)``. ``reasoning`` merges ``existing_reasoning``
+    (e.g. from a separate on_reasoning stream) with the extracted block.
+    """
+    text = '' if raw_content is None else str(raw_content)
+    if not text:
+        return text, (existing_reasoning or '')
+    # Leading-only, single block — same three tag pairs as the JS helper.
+    _pairs = (
+        ('<think>', '</think>'),
+        ('<|channel>thought\n', '<channel|>'),
+        ('<|turn|>thinking\n', '<turn|>'),
+    )
+    trimmed = text.lstrip()
+    extracted = ''
+    remaining = text
+    for open_tag, close_tag in _pairs:
+        if not trimmed.startswith(open_tag):
+            continue
+        ci = trimmed.find(close_tag, len(open_tag))
+        if ci == -1:
+            break  # partial open — leave intact
+        extracted = trimmed[len(open_tag):ci]
+        remaining = trimmed[ci + len(close_tag):].lstrip()
+        break
+    if not extracted:
+        return raw_content, (existing_reasoning or '')
+    final_reasoning = (existing_reasoning + '\n\n' + extracted) if existing_reasoning else extracted
+    return remaining, final_reasoning
+
+
 def _strip_thinking_markup(text: str) -> str:
     """Remove common reasoning/thinking wrappers from model text."""
     if not text:
@@ -5996,11 +6039,30 @@ def _run_agent_streaming(
                 # Must run BEFORE s.save() — otherwise the mutation lives only in
                 # memory until the next turn's save, and the last-turn thinking card
                 # is lost when the user reloads immediately after a response.
-                if _reasoning_text and s.messages:
+                #
+                # #3455: also split any inline leading <think> block out of the saved
+                # assistant content into m['reasoning'] (server-side twin of the JS
+                # _splitThinkFromContent). Inline-thinking providers (e.g. MiniMax-M3)
+                # otherwise leave the thinking trace in m['content'], bloating the
+                # persisted session file 30-50% and bypassing the thinking card. The
+                # split is leading-only/single-block so mid-body literal tags (e.g. in
+                # a fenced code block) stay visible content.
+                if s.messages:
                     for _rm in reversed(s.messages):
-                        if isinstance(_rm, dict) and _rm.get('role') == 'assistant':
-                            _rm['reasoning'] = _reasoning_text
-                            break
+                        if not (isinstance(_rm, dict) and _rm.get('role') == 'assistant'):
+                            continue
+                        _existing_reasoning = _reasoning_text or _rm.get('reasoning') or ''
+                        _content = _rm.get('content')
+                        if isinstance(_content, str) and _content:
+                            _new_content, _merged_reasoning = _split_thinking_from_content(
+                                _content, _existing_reasoning
+                            )
+                            _rm['content'] = _new_content
+                            if _merged_reasoning:
+                                _rm['reasoning'] = _merged_reasoning
+                        elif _existing_reasoning:
+                            _rm['reasoning'] = _existing_reasoning
+                        break
                 try:
                     _turn_duration_seconds = max(0.0, time.time() - float(_turn_started_at))
                 except Exception:

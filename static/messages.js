@@ -835,6 +835,40 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const clean=_stripLiveVisibleAssistantEchoFromThinking(liveReasoningText, visibleInterimSnippets);
     return clean || 'Thinking…';
   }
+  // Split a content string into {reasoning, content} by extracting any <think>...
+  // blocks (or other known reasoning-tag pairs). If reasoning is already
+  // populated on the message (e.g. from a separate on_reasoning stream), the
+  // inline blocks are stripped but the existing reasoning field is preserved.
+  // Provider-bug workaround: M3 (and similar reasoning models) emit the
+  // thinking inline in the OpenAI-compat content stream instead of a separate
+  // reasoning channel, which would otherwise bloat the persisted session
+  // message by 30-50% and miss the m.reasoning field used by the thinking card.
+  function _splitThinkFromContent(rawContent, existingReasoning){
+    const text=String(rawContent||'');
+    if(!text) return {reasoning:existingReasoning||'', content:text};
+    // Extract exactly ONE leading think block (after lstrip), matching the
+    // streaming renderer's _streamDisplay/_parseStreamState semantics EXACTLY —
+    // both strip only the first leading block. A closed <think>...</think> that
+    // appears MID-BODY is, by the renderer's definition, visible content (e.g. a
+    // literal tag inside a fenced code block); a whole-body scan would silently
+    // move it into m.reasoning. And looping multiple leading blocks here (when the
+    // renderer strips only one) would make persisted/reload content diverge from
+    // the live stream. So: leading, single, partial-open left intact (#3455 review, Codex).
+    let extracted='';
+    let remaining=text;
+    const trimmed=text.trimStart();
+    for(const {open,close} of _thinkPairs){
+      if(!trimmed.startsWith(open)) continue;
+      const ci=trimmed.indexOf(close,open.length);
+      if(ci===-1) break; // partial open — leave intact for the live renderer
+      extracted=trimmed.slice(open.length,ci);
+      remaining=trimmed.slice(ci+close.length).replace(/^\s+/,'');
+      break;
+    }
+    if(!extracted) return {reasoning:existingReasoning||'', content:rawContent};
+    const finalReasoning=existingReasoning?existingReasoning+'\n\n'+extracted:extracted;
+    return {reasoning:finalReasoning, content:remaining};
+  }
   function syncInflightAssistantMessage(){
     const inflight=INFLIGHT[activeSid];
     if(!inflight) return;
@@ -845,14 +879,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(msg&&msg.role==='assistant'&&msg._live){assistantIdx=i;break;}
     }
     const ts=Date.now()/1000;
+    // Split inline <think> blocks into m.reasoning so the persisted inflight
+    // state stays compact and the thinking card has a proper source field.
+    const split=_splitThinkFromContent(assistantText, reasoningText);
     if(assistantIdx>=0){
-      inflight.messages[assistantIdx].content=assistantText;
-      inflight.messages[assistantIdx].reasoning=reasoningText||undefined;
+      inflight.messages[assistantIdx].content=split.content;
+      inflight.messages[assistantIdx].reasoning=split.reasoning||undefined;
       inflight.messages[assistantIdx]._ts=inflight.messages[assistantIdx]._ts||ts;
       _throttledPersist();
       return;
     }
-    inflight.messages.push({role:'assistant',content:assistantText,reasoning:reasoningText||undefined,_live:true,_ts:ts});
+    inflight.messages.push({role:'assistant',content:split.content,reasoning:split.reasoning||undefined,_live:true,_ts:ts});
     _throttledPersist();
   }
   function ensureAssistantRow(force=false){
@@ -1927,6 +1964,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const lastAsst=[...S.messages].reverse().find(m=>m.role==='assistant');
           // Persist reasoning trace so thinking card survives page reload
           if(reasoningText&&lastAsst&&!lastAsst.reasoning) lastAsst.reasoning=reasoningText;
+          // Strip any inline <think> blocks still embedded in the server-side
+          // content (M3 OpenAI-compat doesn't separate reasoning). Move them
+          // to m.reasoning so the persisted session stays compact and the
+          // thinking card has a proper source field on reload.
+          if(lastAsst && typeof lastAsst.content === 'string' && lastAsst.content){
+            const split=_splitThinkFromContent(lastAsst.content, lastAsst.reasoning);
+            if(split.content!==lastAsst.content){
+              lastAsst.content=split.content;
+              if(split.reasoning) lastAsst.reasoning=split.reasoning;
+            }
+          }
           // Stamp _ts on the last assistant message if it has no timestamp
           if(lastAsst&&!lastAsst._ts&&!lastAsst.timestamp) lastAsst._ts=Date.now()/1000;
           if(d.usage){

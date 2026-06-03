@@ -571,8 +571,14 @@ def test_live_stream_tokens_persist_partial_assistant_for_session_switch(cleanup
     messages_src = (REPO_ROOT / "static/messages.js").read_text()
     ui_src = (REPO_ROOT / "static/ui.js").read_text()
 
-    assert "content:assistantText" in messages_src, \
-        "messages.js must persist the partial assistant text into INFLIGHT state"
+    # #3455: the persisted partial assistant content is now the think-split content
+    # (inline <think> moved to m.reasoning), so the push uses content:split.content
+    # where split=_splitThinkFromContent(assistantText, ...). The invariant — partial
+    # assistant text is mirrored into INFLIGHT state — is unchanged.
+    assert "content:split.content" in messages_src, \
+        "messages.js must persist the (think-split) partial assistant text into INFLIGHT state"
+    assert "_splitThinkFromContent(assistantText" in messages_src, \
+        "the persisted partial must be derived from the live assistantText"
     assert "_live:true" in messages_src, \
         "messages.js must mark the persisted in-flight assistant row so renderMessages can re-anchor it"
     assert "syncInflightAssistantMessage();" in messages_src, \

@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.413] — 2026-06-14 — Release NZ (restore approval pending-fallback reliability, #4107)
+
+### Fixed
+
+- **Approval cards no longer get stuck when the live SSE notification is missed (#4107).** The approval pending-fallback (the polling path that recovers an approval prompt when the SSE event doesn't arrive) was unreliable: the gateway mirror token couldn't persist on the in-memory approval entry, so a fresh `approval_id` was minted on every poll and the client's resolve never matched; and a stale explicit `approval_id` could resolve a different live gateway entry through the no-id fallback. The mirror token is now stored on the entry's `data` dict so `approval_id` stays stable across reconciles, and the `_gateway_queues` fallback only fires when no explicit `approval_id` was supplied (preserving the legacy no-id client path). (#4107)
+
 ## [v0.51.412] — 2026-06-14 — Release NY (gateway reasoning previews + regenerate-title for CLI/TUI sessions, #4146/#4183)
 
 ### Fixed

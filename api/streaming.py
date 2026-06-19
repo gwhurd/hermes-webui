@@ -3466,6 +3466,12 @@ def _sanitize_messages_for_api(messages, *, cfg: dict = None):
         # API 400 errors on strict providers (empty assistant content).
         if msg.get('_partial') and not str(msg.get('content') or '').strip():
             continue
+        # Note: _recovered user messages are NOT skipped here — they may need
+        # to be retained to preserve role alternation when a kept assistant
+        # follows.  The _recovered skip happens in a final pass after orphaned
+        # tool_calls are stripped, so the anchor check is exact (#4283).
+        # Temporarily mark _recovered users so the final pass can find them.
+        is_recovered = msg.get('_recovered') and msg.get('role') == 'user'
         role = msg.get('role')
         if role == 'tool':
             tid = msg.get('tool_call_id') or ''
@@ -3473,6 +3479,8 @@ def _sanitize_messages_for_api(messages, *, cfg: dict = None):
                 # Orphaned tool result — skip to avoid 400 from strict providers.
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        if is_recovered:
+            sanitized['_recovered'] = True  # temporary marker — stripped before return
         if strip_native_images and 'content' in sanitized:
             sanitized['content'] = _strip_native_image_parts_from_content(sanitized.get('content'))
         if sanitized.get('role'):
@@ -3505,7 +3513,35 @@ def _sanitize_messages_for_api(messages, *, cfg: dict = None):
             else:
                 msg = dict(msg, tool_calls=kept)
         filtered_clean.append(msg)
-    return filtered_clean
+
+    # Fourth pass: drop _recovered user messages unless removing one would fuse
+    # two same-role neighbours.  Operating on filtered_clean (post orphaned-tool/
+    # tool_calls stripping) means the neighbour check is exact (#4283).  The
+    # decision uses the ACTUAL kept sequence: the previously-kept message's role
+    # (`final[-1]`) and the next surviving message's role.  A _recovered user is
+    # kept ONLY when it separates two assistants (prev kept == assistant AND next
+    # surviving == assistant) — i.e. it is an answered turn whose removal would
+    # leave `assistant, assistant` adjacency.  In every other case dropping it is
+    # safe and correct: it would either leave a clean `user, assistant` pair, or
+    # (if next is a user) it is a stale unanswered prompt that must not replay.
+    # Deciding only on "an assistant follows" (ignoring the prev kept role) is the
+    # bug that re-introduced `user, _recovered user, assistant` → adjacent users
+    # → strict-provider 400 once the anchoring assistant's predecessor was a user.
+    final = []
+    for i, msg in enumerate(filtered_clean):
+        if msg.get('_recovered') and msg.get('role') == 'user':
+            prev_role = final[-1].get('role') if final else None
+            next_role = None
+            for j in range(i + 1, len(filtered_clean)):
+                next_role = filtered_clean[j].get('role')
+                break
+            # Keep only if this recovered user actually separates two assistants.
+            if not (prev_role == 'assistant' and next_role == 'assistant'):
+                continue  # drop — fusing the neighbours is clean, or it's a stale prompt
+            # Keep but strip the temporary marker
+            msg = {k: v for k, v in msg.items() if k != '_recovered'}
+        final.append(msg)
+    return final
 
 
 def _api_safe_message_positions(messages):
@@ -3531,12 +3567,17 @@ def _api_safe_message_positions(messages):
             continue
         if msg.get('_partial') and not str(msg.get('content') or '').strip():
             continue
+        # Note: _recovered user messages are NOT skipped here — deferred to
+        # a final pass after orphaned tool_calls stripping (#4283).
+        is_recovered = msg.get('_recovered') and msg.get('role') == 'user'
         role = msg.get('role')
         if role == 'tool':
             tid = msg.get('tool_call_id') or ''
             if not tid or tid not in valid_tool_call_ids:
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        if is_recovered:
+            sanitized['_recovered'] = True  # temporary marker — stripped before return
         if sanitized.get('role'):
             out.append((idx, sanitized))
 
@@ -3564,7 +3605,24 @@ def _api_safe_message_positions(messages):
             else:
                 msg = dict(msg, tool_calls=kept)
         filtered_out.append((idx, msg))
-    return filtered_out
+
+    # Fourth pass: drop _recovered user messages unless removing one would fuse
+    # two same-role neighbours — mirrors _sanitize_messages_for_api pass 4 (#4283).
+    # Decide on the ACTUAL kept sequence: prev kept role (final_out[-1]) + next
+    # surviving role. Keep ONLY when it separates two assistants; otherwise drop.
+    final_out = []
+    for i, (idx, msg) in enumerate(filtered_out):
+        if msg.get('_recovered') and msg.get('role') == 'user':
+            prev_role = final_out[-1][1].get('role') if final_out else None
+            next_role = None
+            for j in range(i + 1, len(filtered_out)):
+                next_role = filtered_out[j][1].get('role')
+                break
+            if not (prev_role == 'assistant' and next_role == 'assistant'):
+                continue
+            msg = {k: v for k, v in msg.items() if k != '_recovered'}
+        final_out.append((idx, msg))
+    return final_out
 
 
 def _deduplicate_context_messages(messages):
@@ -5016,6 +5074,23 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     if pending_attachments:
         recovered['attachments'] = list(pending_attachments)
     session.messages.append(recovered)
+    # Mirror to context_messages so the _recovered flag survives the state.db
+    # round-trip (#4283).  state.db has no _recovered column, so without this
+    # mirror the next turn's reconciled_state_db_messages_for_session(
+    # prefer_context=True) finds the recovered user as a flagless state.db
+    # delta and _sanitize_messages_for_api cannot filter it — causing the
+    # interrupted turn's prompt to be prepended to every subsequent turn.
+    # Placing the mirror here (rather than in _persist_cancelled_turn) covers
+    # all three callers: cancel, provider-error, and exception paths.
+    ctx = getattr(session, 'context_messages', None)
+    if isinstance(ctx, list) and ctx:
+        rec_text = " ".join(str(recovered.get('content') or '').split())
+        if not any(
+            isinstance(e, dict) and e.get('role') == 'user'
+            and " ".join(str(e.get('content') or '').split()) == rec_text
+            for e in ctx[-8:]
+        ):
+            ctx.append({k: v for k, v in recovered.items() if k != 'timestamp'})
     # The new user turn is now committed to messages (#3831): retire a positive
     # truncation watermark left over from a prior retry/undo/edit so it cannot
     # freeze at the old edit boundary and later drop these post-edit turns on an

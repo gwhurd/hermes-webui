@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.512] — 2026-06-19 — Release RW (interrupted-turn user prompt no longer replays)
+
+### Fixed
+
+- **A user prompt from an interrupted turn no longer replays in every subsequent request (#4283).** When a turn was interrupted, its recovered user message could be re-sent on later requests (and, in some orphaned-tool shapes, produce two adjacent same-role messages that strict providers reject with a 400). The API-message sanitizer now decides whether to keep a recovered user message based on the actual post-sanitization neighbours — it is kept only when it genuinely separates two assistant turns, and dropped otherwise — with the same logic applied in both the sanitizer and the safe-position mirror. Thanks @kaishi00.
+
 ## [v0.51.511] — 2026-06-19 — Release RV (virtual transcript renders during programmatic scrolls)
 
 ### Fixed

@@ -5,8 +5,6 @@ PR #4495 fixed the runs API path but left the legacy path without approval handl
 """
 from __future__ import annotations
 
-import inspect
-import re
 from pathlib import Path
 
 from api.gateway_chat import _gateway_runs_approval_event

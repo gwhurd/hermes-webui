@@ -4219,7 +4219,7 @@ def _pool_entry_payloads(provider_id: str) -> list[dict[str, Any]]:
             str(getattr(entry, "key_source", "") or ""),
         ):
             continue
-        if hasattr(entry, "to_dict") and callable(getattr(entry, "to_dict")):
+        if hasattr(entry, "to_dict") and callable(entry.to_dict):
             payload = entry.to_dict()
         elif isinstance(entry, dict):
             payload = dict(entry)

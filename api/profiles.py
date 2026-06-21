@@ -865,7 +865,6 @@ def _apply_profile_env_to_process(
     for key in secret_env_names:
         if key not in safe_runtime_env:
             process_env.pop(key, None)
-    process_env.update(safe_runtime_env)
     return previous_env
 
 
@@ -936,6 +935,7 @@ def profile_env_for_background_worker(
             had_hermes_home = "HERMES_HOME" in os.environ
             old_hermes_home = os.environ.get("HERMES_HOME")
             skill_home_snapshot = snapshot_skill_home_modules()
+            os.environ.update(safe_runtime_env)
             os.environ["HERMES_HOME"] = str(profile_home_path)
             try:
                 patch_skill_home_modules(profile_home_path)

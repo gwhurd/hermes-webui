@@ -11624,6 +11624,14 @@ def handle_post(handler, parsed) -> bool:
             worktree_info=worktree_info,
             enabled_toolsets=enabled_toolsets,
         )
+        try:
+            from api.web_push import get_push_owner
+
+            push_owner = get_push_owner(handler)
+            if push_owner:
+                s.push_owner = push_owner
+        except Exception:
+            logger.debug("Failed to read Web Push owner for new session", exc_info=True)
         if worktree_info:
             publish_session_list_changed(
                 "session_new",
@@ -11666,6 +11674,7 @@ def handle_post(handler, parsed) -> bool:
                 archived=False,
                 project_id=session.project_id,
                 profile=session.profile,
+                push_owner=getattr(session, "push_owner", None),
                 input_tokens=session.input_tokens,
                 output_tokens=session.output_tokens,
                 estimated_cost=session.estimated_cost,
@@ -16633,22 +16642,24 @@ def _handle_push_vapid_public_key(handler):
 
 
 def _handle_push_subscribe(handler, body):
-    from api.web_push import upsert_subscription, web_push_status
+    from api.web_push import ensure_push_owner_cookie, upsert_subscription, web_push_status
 
     if not web_push_status().get("enabled"):
         return bad(handler, "Web Push is not configured", 409)
+    owner_key, set_cookie_header = ensure_push_owner_cookie(handler)
     subscription = body.get("subscription") if isinstance(body, dict) else None
     if not isinstance(subscription, dict):
         subscription = body if isinstance(body, dict) else {}
     try:
-        saved = upsert_subscription(subscription)
+        saved = upsert_subscription(subscription, owner_key=owner_key)
     except ValueError as exc:
         return bad(handler, str(exc), 400)
-    return j(handler, {"ok": True, "subscription": saved})
+    extra_headers = {"Set-Cookie": set_cookie_header} if set_cookie_header else None
+    return j(handler, {"ok": True, "subscription": saved}, extra_headers=extra_headers)
 
 
 def _handle_push_unsubscribe(handler, body):
-    from api.web_push import remove_subscription
+    from api.web_push import get_push_owner, remove_subscription
 
     endpoint = ""
     if isinstance(body, dict):
@@ -16657,7 +16668,7 @@ def _handle_push_unsubscribe(handler, body):
             endpoint = str(body["subscription"].get("endpoint") or "").strip()
     if not endpoint:
         return bad(handler, "subscription endpoint is required", 400)
-    removed = remove_subscription(endpoint)
+    removed = remove_subscription(endpoint, owner_key=get_push_owner(handler))
     return j(handler, {"ok": True, "removed": removed})
 
 
@@ -17775,6 +17786,14 @@ def _handle_goal_command(handler, body):
         )
         if not has_persisted_turns:
             s.profile = requested_profile
+    try:
+        from api.web_push import get_push_owner
+
+        push_owner = get_push_owner(handler)
+        if push_owner:
+            s.push_owner = push_owner
+    except Exception:
+        logger.debug("Failed to stamp Web Push owner for goal session %s", body.get("session_id"), exc_info=True)
 
     current_stream_id = getattr(s, "active_stream_id", None)
     stream_running = False
@@ -17986,6 +18005,14 @@ def _handle_chat_start(handler, body, diag=None):
                 # currently-selected profile instead of the stale one stamped at
                 # creation time.
                 s.profile = requested_profile
+        try:
+            from api.web_push import get_push_owner
+
+            push_owner = get_push_owner(handler)
+            if push_owner:
+                s.push_owner = push_owner
+        except Exception:
+            logger.debug("Failed to stamp Web Push owner for session %s", body.get("session_id"), exc_info=True)
         diag.stage("normalize_message") if diag else None
         msg = str(body.get("message", "")).strip()
         if not msg:

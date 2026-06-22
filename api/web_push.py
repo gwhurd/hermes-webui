@@ -5,14 +5,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import tempfile
 import threading
+from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import quote
 
 
 logger = logging.getLogger(__name__)
 _PUSH_STORE_NAME = "webui_push_subscriptions.json"
+_PUSH_OWNER_COOKIE_NAME = "hermes_push_owner"
 _STORE_LOCK = threading.Lock()
 _WEB_PUSH_TIMEOUT_SECONDS = 10
 
@@ -37,7 +40,15 @@ def _load_store() -> dict:
     subs = data.get("subscriptions")
     if not isinstance(subs, list):
         return {"subscriptions": []}
-    return {"subscriptions": [sub for sub in subs if isinstance(sub, dict)]}
+    normalized = []
+    for sub in subs:
+        if not isinstance(sub, dict):
+            continue
+        try:
+            normalized.append(_normalize_subscription(sub, owner_key=sub.get("owner")))
+        except ValueError:
+            logger.debug("Skipping malformed Web Push subscription entry", exc_info=True)
+    return {"subscriptions": normalized}
 
 
 def _save_store(store: dict) -> None:
@@ -57,7 +68,61 @@ def _save_store(store: dict) -> None:
         raise
 
 
-def _normalize_subscription(subscription: dict) -> dict:
+def _normalize_push_owner(owner_key: str | None) -> str:
+    owner = str(owner_key or "").strip()
+    if not owner:
+        raise ValueError("web push owner is required")
+    return owner
+
+
+def _parse_cookie_value(handler, cookie_name: str) -> str | None:
+    headers = getattr(handler, "headers", None)
+    cookie_header = headers.get("Cookie", "") if headers else ""
+    if not cookie_header:
+        return None
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header)
+    except Exception:
+        return None
+    morsel = cookie.get(cookie_name)
+    if not morsel:
+        return None
+    value = str(morsel.value or "").strip()
+    return value or None
+
+
+def get_push_owner(handler) -> str | None:
+    owner = _parse_cookie_value(handler, _PUSH_OWNER_COOKIE_NAME)
+    if not owner:
+        return None
+    try:
+        return _normalize_push_owner(owner)
+    except ValueError:
+        return None
+
+
+def ensure_push_owner_cookie(handler) -> tuple[str, str | None]:
+    owner = get_push_owner(handler)
+    if owner:
+        return owner, None
+    owner = secrets.token_hex(32)
+    cookie = SimpleCookie()
+    cookie[_PUSH_OWNER_COOKIE_NAME] = owner
+    cookie[_PUSH_OWNER_COOKIE_NAME]["httponly"] = True
+    cookie[_PUSH_OWNER_COOKIE_NAME]["samesite"] = "Lax"
+    cookie[_PUSH_OWNER_COOKIE_NAME]["path"] = "/"
+    try:
+        from api.auth import _is_secure_context
+
+        if _is_secure_context(handler):
+            cookie[_PUSH_OWNER_COOKIE_NAME]["secure"] = True
+    except Exception:
+        logger.debug("Failed to resolve secure context for push-owner cookie", exc_info=True)
+    return owner, cookie[_PUSH_OWNER_COOKIE_NAME].OutputString()
+
+
+def _normalize_subscription(subscription: dict, *, owner_key: str | None) -> dict:
     endpoint = str((subscription or {}).get("endpoint") or "").strip()
     if not endpoint:
         raise ValueError("subscription endpoint is required")
@@ -71,6 +136,7 @@ def _normalize_subscription(subscription: dict) -> dict:
     normalized = {
         "endpoint": endpoint,
         "keys": {"p256dh": p256dh, "auth": auth},
+        "owner": _normalize_push_owner(owner_key),
     }
     expiration = (subscription or {}).get("expirationTime")
     if expiration not in (None, ""):
@@ -78,8 +144,14 @@ def _normalize_subscription(subscription: dict) -> dict:
     return normalized
 
 
-def list_subscriptions() -> list[dict]:
-    return list(_load_store()["subscriptions"])
+def list_subscriptions(*, owner_key: str | None = None) -> list[dict]:
+    subscriptions = list(_load_store()["subscriptions"])
+    if owner_key is None:
+        return subscriptions
+    owner = str(owner_key or "").strip()
+    if not owner:
+        return []
+    return [sub for sub in subscriptions if str(sub.get("owner") or "").strip() == owner]
 
 
 def _mutate_store(mutator) -> tuple[object, bool]:
@@ -91,8 +163,8 @@ def _mutate_store(mutator) -> tuple[object, bool]:
         return result, changed
 
 
-def upsert_subscription(subscription: dict) -> dict:
-    normalized = _normalize_subscription(subscription)
+def upsert_subscription(subscription: dict, *, owner_key: str | None) -> dict:
+    normalized = _normalize_subscription(subscription, owner_key=owner_key)
 
     def _apply(store: dict) -> tuple[dict, bool]:
         subs = [sub for sub in store["subscriptions"] if sub.get("endpoint") != normalized["endpoint"]]
@@ -105,19 +177,42 @@ def upsert_subscription(subscription: dict) -> dict:
     return result
 
 
-def remove_subscription(endpoint: str) -> bool:
+def remove_subscription(endpoint: str, *, owner_key: str | None = None) -> bool:
     endpoint = str(endpoint or "").strip()
     if not endpoint:
         return False
+    owner = str(owner_key or "").strip()
 
     def _apply(store: dict) -> tuple[bool, bool]:
         before = len(store["subscriptions"])
-        store["subscriptions"] = [sub for sub in store["subscriptions"] if sub.get("endpoint") != endpoint]
+        store["subscriptions"] = [
+            sub
+            for sub in store["subscriptions"]
+            if not (
+                sub.get("endpoint") == endpoint
+                and (not owner or str(sub.get("owner") or "").strip() == owner)
+            )
+        ]
         changed = len(store["subscriptions"]) != before
         return changed, changed
 
     result, _ = _mutate_store(_apply)
     return result
+
+
+def _session_push_owner(session_id: str) -> str | None:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    try:
+        from api.models import Session
+
+        session = Session.load_metadata_only(sid)
+    except Exception:
+        logger.debug("Failed to load Web Push owner for session %s", sid, exc_info=True)
+        return None
+    owner = str(getattr(session, "push_owner", "") or "").strip()
+    return owner or None
 
 
 def _get_pywebpush_impl():
@@ -156,7 +251,7 @@ def _notification_payload(title: str, body: str, *, session_id: str | None = Non
     }
 
 
-def send_web_push(payload: dict) -> int:
+def send_web_push(payload: dict, *, owner_key: str | None) -> int:
     from api.config import (
         web_push_private_key,
         web_push_subject,
@@ -165,7 +260,10 @@ def send_web_push(payload: dict) -> int:
     status = web_push_status()
     if not status["enabled"]:
         return 0
-    subscriptions = list_subscriptions()
+    owner = str(owner_key or "").strip()
+    if not owner:
+        return 0
+    subscriptions = list_subscriptions(owner_key=owner)
     if not subscriptions:
         return 0
     webpush_fn, _ = _get_pywebpush_impl()
@@ -192,27 +290,39 @@ def send_web_push(payload: dict) -> int:
                 stale_endpoints.append(str(subscription.get("endpoint") or ""))
             logger.debug("Web Push send failed for %s", subscription.get("endpoint"), exc_info=True)
     for endpoint in stale_endpoints:
-        remove_subscription(endpoint)
+        remove_subscription(endpoint, owner_key=owner)
     return sent
 
 
 def notify_bg_task_complete(session_id: str, payload: dict) -> int:
     title = str((payload or {}).get("title") or "Background task complete")
     body = str((payload or {}).get("message") or "Task finished")
-    return send_web_push(_notification_payload(title, body, session_id=session_id))
+    return send_web_push(
+        _notification_payload(title, body, session_id=session_id),
+        owner_key=_session_push_owner(session_id),
+    )
 
 
 def notify_response_complete(session_id: str, answer: str) -> int:
     text = str(answer or "").strip()
     body = text[:120] if text else "Task finished"
-    return send_web_push(_notification_payload("Response complete", body, session_id=session_id))
+    return send_web_push(
+        _notification_payload("Response complete", body, session_id=session_id),
+        owner_key=_session_push_owner(session_id),
+    )
 
 
 def notify_approval_required(session_id: str, approval: dict) -> int:
     body = str((approval or {}).get("description") or "Tool approval needed")
-    return send_web_push(_notification_payload("Approval required", body, session_id=session_id))
+    return send_web_push(
+        _notification_payload("Approval required", body, session_id=session_id),
+        owner_key=_session_push_owner(session_id),
+    )
 
 
 def notify_clarify_required(session_id: str, clarify: dict) -> int:
     body = str((clarify or {}).get("question") or "Tool clarification needed")
-    return send_web_push(_notification_payload("Clarification needed", body, session_id=session_id))
+    return send_web_push(
+        _notification_payload("Clarification needed", body, session_id=session_id),
+        owner_key=_session_push_owner(session_id),
+    )

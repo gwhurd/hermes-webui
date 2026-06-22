@@ -9864,8 +9864,6 @@ def handle_get(handler, parsed) -> bool:
             version_token = quote(WEBUI_VERSION, safe="")
             text = sw_path.read_text(encoding="utf-8").replace(
                 "__WEBUI_VERSION__", version_token
-            ).replace(
-                "__CSRF_TOKEN_JSON__", json.dumps(_request_csrf_token(handler))
             )
             data = text.encode("utf-8")
             handler.send_response(200)
@@ -16628,7 +16626,9 @@ def _handle_cron_recent(handler, parsed):
 def _handle_push_status(handler):
     from api.web_push import web_push_status
 
-    return j(handler, web_push_status())
+    status = dict(web_push_status())
+    status["csrf_token"] = _request_csrf_token(handler)
+    return j(handler, status)
 
 
 def _handle_push_vapid_public_key(handler):

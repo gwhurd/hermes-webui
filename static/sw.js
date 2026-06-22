@@ -8,7 +8,6 @@
 // Cache version is injected by the server at request time (routes.py /sw.js handler).
 // Bumps automatically whenever the git commit changes — no manual edits needed.
 const CACHE_NAME = 'hermes-shell-__WEBUI_VERSION__';
-const WEB_PUSH_CSRF_TOKEN = __CSRF_TOKEN_JSON__;
 
 // Static assets that form the app shell.
 //
@@ -180,12 +179,13 @@ function _webPushScopeUrl(path) {
 }
 
 async function _webPushFetchJson(path, options = {}) {
-  const headers = {'Content-Type': 'application/json', ...(options.headers || {})};
-  if (WEB_PUSH_CSRF_TOKEN) headers['X-Hermes-CSRF-Token'] = WEB_PUSH_CSRF_TOKEN;
+  const {csrfToken = '', headers: extraHeaders = {}, ...fetchOptions} = options || {};
+  const headers = {'Content-Type': 'application/json', ...extraHeaders};
+  if (csrfToken) headers['X-Hermes-CSRF-Token'] = csrfToken;
   const response = await fetch(_webPushScopeUrl(path), {
     credentials: 'same-origin',
     headers,
-    ...options,
+    ...fetchOptions,
   });
   if (!response.ok) throw new Error(`Web Push route failed: ${response.status}`);
   const text = await response.text();
@@ -250,11 +250,13 @@ self.addEventListener('pushsubscriptionchange', (event) => {
   event.waitUntil((async () => {
     try {
       const status = await _webPushFetchJson('/api/push/status');
+      const csrfToken = typeof status.csrf_token === 'string' ? status.csrf_token : '';
       const oldEndpoint = event.oldSubscription && event.oldSubscription.endpoint;
       if (!status || !status.enabled) {
         if (oldEndpoint) {
           await _webPushFetchJson('/api/push/subscribe', {
             method: 'DELETE',
+            csrfToken,
             body: JSON.stringify({ endpoint: oldEndpoint }),
           }).catch(() => {});
         }
@@ -273,11 +275,13 @@ self.addEventListener('pushsubscriptionchange', (event) => {
         : JSON.parse(JSON.stringify(subscription || {}));
       await _webPushFetchJson('/api/push/subscribe', {
         method: 'POST',
+        csrfToken,
         body: JSON.stringify({ subscription: payload }),
       });
       if (oldEndpoint && payload.endpoint && oldEndpoint !== payload.endpoint) {
         await _webPushFetchJson('/api/push/subscribe', {
           method: 'DELETE',
+          csrfToken,
           body: JSON.stringify({ endpoint: oldEndpoint }),
         }).catch(() => {});
       }

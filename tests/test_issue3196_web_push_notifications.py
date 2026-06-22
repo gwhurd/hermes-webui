@@ -117,6 +117,7 @@ def test_push_routes_support_status_subscribe_and_delete(monkeypatch, tmp_path):
 
     store_path = tmp_path / "webui_push_subscriptions.json"
     monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "_request_csrf_token", lambda handler: "csrf-live")
     monkeypatch.setattr(web_push, "_subscription_store_path", lambda: store_path)
     monkeypatch.setattr(web_push, "web_push_status", lambda: {
         "enabled": True,
@@ -132,6 +133,7 @@ def test_push_routes_support_status_subscribe_and_delete(monkeypatch, tmp_path):
         "enabled": True,
         "configured": True,
         "dependency_available": True,
+        "csrf_token": "csrf-live",
     }
 
     key_handler = _JSONHandler()
@@ -207,6 +209,7 @@ def test_push_status_reports_unavailable_when_pywebpush_missing(monkeypatch):
     import api.web_push as web_push
 
     monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
+    monkeypatch.setattr(routes, "_request_csrf_token", lambda handler: "csrf-live")
     monkeypatch.setattr(config, "web_push_configured", lambda: True)
     monkeypatch.setattr(web_push, "_get_pywebpush_impl", lambda: (None, None))
 
@@ -217,6 +220,7 @@ def test_push_status_reports_unavailable_when_pywebpush_missing(monkeypatch):
         "enabled": False,
         "configured": True,
         "dependency_available": False,
+        "csrf_token": "csrf-live",
     }
 
     subscribe_handler = _JSONHandler({"subscription": _subscription("https://push.example/browser")})
@@ -511,8 +515,9 @@ def test_chat_start_stamps_session_push_owner_from_cookie(monkeypatch):
 def test_static_sources_cover_closed_app_push_flow():
     assert "self.addEventListener('push', (event) => {" in SW_JS
     assert "self.addEventListener('pushsubscriptionchange', (event) => {" in SW_JS
-    assert "const WEB_PUSH_CSRF_TOKEN = __CSRF_TOKEN_JSON__;" in SW_JS
-    assert "headers['X-Hermes-CSRF-Token'] = WEB_PUSH_CSRF_TOKEN;" in SW_JS
+    assert "__CSRF_TOKEN_JSON__" not in SW_JS
+    assert "const csrfToken = typeof status.csrf_token === 'string' ? status.csrf_token : '';" in SW_JS
+    assert "if (csrfToken) headers['X-Hermes-CSRF-Token'] = csrfToken;" in SW_JS
     assert "self.registration.showNotification(payload.title, payload.options)" in SW_JS
     assert "self.clients.matchAll({type: 'window', includeUncontrolled: true})" in SW_JS
     assert "client.visibilityState === 'visible' || client.focused === true" in SW_JS

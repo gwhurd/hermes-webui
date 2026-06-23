@@ -8618,6 +8618,16 @@ def _run_agent_streaming(
                 # so it doesn't block the stream.
                 _maybe_schedule_title_refresh(s, put, agent)
         finally:
+            # #4729: guaranteed-exit flush of any reasoning tail still buffered. On the
+            # normal path the on_token/on_tool/post-run flushes already emptied it (no-op
+            # here); on an exception or retry path that bypassed those, this emits the tail
+            # before the outer handler sends apperror — so the live Thinking view never
+            # loses its last coalesced chunk. Runs before stream teardown; STREAM_REASONING_TEXT
+            # already mirrors the full text for persistence regardless.
+            try:
+                _flush_reasoning_buffer()
+            except Exception:
+                pass
             # Stop the live metering ticker
             _metering_stop.set()
             # Unregister the gateway approval callback and unblock any threads

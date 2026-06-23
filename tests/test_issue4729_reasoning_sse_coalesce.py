@@ -94,11 +94,20 @@ def test_reasoning_buffer_flushed_at_every_boundary():
     assert "_flush_reasoning_buffer()" in on_tool, (
         "on_tool must flush the reasoning tail before the tool event (reasoning→tool transition)"
     )
-    # terminal catch-all: flush right after the agent run returns
-    assert "persist_user_message=msg_text,\n            )\n            # #4729" in STREAMING and \
-        STREAMING.count("_flush_reasoning_buffer()") >= 4, (
-        "must flush after agent.run_conversation() returns (a turn can end on reasoning "
-        "with no trailing token/tool boundary)"
+    # terminal catch-all: flush right after the agent run returns, AND a guaranteed-exit
+    # flush in the inner finally so exception / retry paths (which bypass the post-run
+    # flush) still emit the tail before the outer apperror.
+    assert "persist_user_message=msg_text,\n            )\n            # #4729" in STREAMING, (
+        "must flush after agent.run_conversation() returns (success path, before done)"
+    )
+    # the inner finally must also flush (covers exception/retry exits)
+    fin = STREAMING[STREAMING.index("        finally:\n            # #4729"):]
+    fin = fin[:700]
+    assert "_flush_reasoning_buffer()" in fin, (
+        "the inner finally must flush the reasoning tail on exception/retry exit paths"
+    )
+    assert STREAMING.count("_flush_reasoning_buffer()") >= 5, (
+        "expected flush at on_token, on_reasoning(None), on_tool, post-run, and the finally"
     )
 
 

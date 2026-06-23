@@ -141,6 +141,17 @@ def test_raw_and_inline_file_targets_carry_anchor_root():
     assert "_serve_file_bytes(handler, target, mime, disposition, \"no-store\", csp=csp, anchor_root=anchor_root)" in raw_handler
 
 
+def test_escape_raw_and_read_routes_use_authorized_helpers():
+    src = ROUTES_PY.read_text(encoding="utf-8")
+    escape_read = _func_body(src, "_handle_escape_file_read")
+    escape_raw = _func_body(src, "_handle_escape_file_raw")
+
+    assert "read_authorized_escape_file_content" in escape_read
+    assert "raw_authorized_escape_target" in escape_raw
+    assert "_serve_inline_html_preview(handler, target, \"no-store\", csp=sandbox_csp, anchor_root=anchor_root)" in escape_raw
+    assert "_serve_file_bytes(handler, target, mime, disposition, \"no-store\", csp=csp, anchor_root=anchor_root)" in escape_raw
+
+
 def test_upload_archive_cleanup_uses_anchored_helpers():
     src = UPLOAD_PY.read_text(encoding="utf-8")
 

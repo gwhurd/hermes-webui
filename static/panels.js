@@ -8616,7 +8616,7 @@ function _extensionPermissionSummary(perms){
         <span class="extension-gallery-permission-label">${esc(label)}</span>
         <span class="extension-gallery-permission-value">${esc(value)}</span>
       </div>`).join('')+'</div>'
-    : '<div class="extension-gallery-permission-empty">No extra permissions declared.</div>';
+    : `<div class="extension-gallery-permission-empty">${esc(t('ext_gallery_permissions_empty'))}</div>`;
   return `<details class="extension-gallery-perms">
     <summary>${esc(t('ext_gallery_permissions_show'))}</summary>
     ${body}

@@ -259,6 +259,7 @@ def test_extensions_gallery_links_sources_and_humanizes_permissions():
     assert "extension-gallery-source-link" in helper_block
     assert "target=\"_blank\"" in helper_block
     assert "rel=\"noopener noreferrer\"" in helper_block
+    assert "t('ext_gallery_permissions_empty')" in helper_block
     assert "webui_api" in helper_block
     assert "sidecar_commands" in helper_block
     assert "dom.mutates_core_views" in helper_block
@@ -309,6 +310,7 @@ def test_extensions_i18n_keys_exist_for_all_locales():
         "settings_tab_extensions",
         "ext_gallery_next_step",
         "ext_gallery_after_install",
+        "ext_gallery_permissions_empty",
         "ext_gallery_local_component_required",
         "ext_gallery_local_app_label",
         "ext_gallery_required_suffix",

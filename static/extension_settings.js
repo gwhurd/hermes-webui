@@ -231,6 +231,9 @@
     }
     return {
       extensionId:clean,
+      trusted:schemas.has(clean),
+      storageOwned:!!meta.storage_owned,
+      supported:supportsSettings(meta),
       schema,
       defaults:defaultsFor(schema),
       get values(){return current();},

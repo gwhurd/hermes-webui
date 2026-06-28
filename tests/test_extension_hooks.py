@@ -270,12 +270,6 @@ def test_extension_manifest_adds_bundled_assets_before_env_urls(tmp_path, monkey
                 "storage_owned": False,
                 "settings_schema": [],
             },
-            {
-                "id": "disabled",
-                "name": "disabled",
-                "storage_owned": False,
-                "settings_schema": [],
-            },
         ],
     }
 

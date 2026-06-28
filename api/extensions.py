@@ -1115,18 +1115,7 @@ def get_extension_config() -> Dict[str, Any]:
             _EXTENSION_STYLESHEET_URLS_ENV, manifest_stylesheets or None
         ),
     }
-    runtime_entries: List[Dict[str, object]] = []
-    if manifest is not None:
-        extension_state = _manifest_extension_state(manifest, disabled_ids)
-        runtime_entries = [
-            {
-                "id": entry["id"],
-                "name": entry["name"],
-                "storage_owned": entry["storage_owned"],
-                "settings_schema": entry["settings_schema"],
-            }
-            for entry in extension_state["extensions"]
-        ]
+    runtime_entries = _extension_runtime_entries(manifest, disabled_ids) if manifest is not None else []
     if runtime_entries:
         config["extensions"] = runtime_entries
     return config

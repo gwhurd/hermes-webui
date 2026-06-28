@@ -8206,6 +8206,9 @@ function _extensionSettingsControls(entry){
     return '<div class="extension-settings-empty">No extension-owned browser storage permission.</div>';
   }
   const settingsApi=window.HermesExtensionSettings&&id?window.HermesExtensionSettings.settingsForExtension(id):null;
+  if(!settingsApi||!settingsApi.trusted){
+    return '<div class="extension-settings-empty">Reload WebUI after enabling or installing this extension to edit browser-local settings.</div>';
+  }
   const values=settingsApi?settingsApi.values:{};
   const fields=schema.length
     ? schema.map(field=>_extensionSettingsFieldHtml(field,values[field.key])).join('')

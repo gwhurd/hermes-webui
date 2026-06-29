@@ -1908,10 +1908,20 @@ def _build_session_list_cache_payload(
         1 for s in scoped
         if _is_cli_session_for_settings(s)
     )
-    if sidebar_source == "webui":
-        scoped = [s for s in scoped if not _is_cli_session_for_settings(s)]
-    elif sidebar_source == "cli":
-        scoped = [s for s in scoped if _is_cli_session_for_settings(s)]
+    def _filter_sidebar_source(rows: list[dict]) -> list[dict]:
+        if sidebar_source == "webui":
+            return [s for s in rows if not _is_cli_session_for_settings(s)]
+        if sidebar_source == "cli":
+            return [s for s in rows if _is_cli_session_for_settings(s)]
+        return list(rows)
+
+    scoped = _filter_sidebar_source(scoped)
+    sidebar_reference_sessions: list[dict] = []
+    if not include_archived:
+        sidebar_reference_sessions = _hidden_archived_sidebar_reference_sessions(
+            _filter_sidebar_source(visible_scoped),
+            _filter_sidebar_source(archived_scoped),
+        )
     if not include_archived:
         diag_stage("filter_archived_sessions")
     diag_stage("visible_lineage_metadata")
@@ -1920,6 +1930,10 @@ def _build_session_list_cache_payload(
         "sessions": [
             dict(s) if isinstance(s, dict) else {}
             for s in scoped
+        ],
+        "sidebar_reference_sessions": [
+            dict(s) if isinstance(s, dict) else {}
+            for s in sidebar_reference_sessions
         ],
         "cli_count": len(deduped_cli),
         "archived_count": archived_count,
@@ -1957,8 +1971,15 @@ def _session_list_payload_to_response(payload: dict) -> dict:
     for s in runtime_rows:
         item = _sidebar_session_response_item(s, redact_enabled=_redact_enabled) if isinstance(s, dict) else {}
         safe_merged.append(item)
+    safe_reference = []
+    for s in payload.get("sidebar_reference_sessions", []) or []:
+        item = _sidebar_session_response_item(s, redact_enabled=_redact_enabled) if isinstance(s, dict) else {}
+        if item:
+            item["_sidebar_reference_only"] = True
+        safe_reference.append(item)
     response = {
         "sessions": safe_merged,
+        "sidebar_reference_sessions": safe_reference,
         "cli_count": int(payload.get("cli_count", 0)),
         "archived_count": int(payload.get("archived_count", 0)),
         "archived_webui_count": int(payload.get("archived_webui_count", 0)),
@@ -1975,6 +1996,53 @@ def _session_list_payload_to_response(payload: dict) -> dict:
     if "cli_session_count" in payload:
         response["cli_session_count"] = int(payload.get("cli_session_count", 0))
     return response
+
+
+def _hidden_archived_sidebar_reference_sessions(
+    visible_rows: list[dict],
+    archived_rows: list[dict],
+) -> list[dict]:
+    """Return hidden archived ancestors needed for client-side sidebar nesting.
+
+    The default sidebar payload intentionally omits archived sessions. The
+    browser still needs a tiny reference row for an archived parent/ancestor so
+    `_attachChildSessionsToSidebarRows()` can suppress its visible child rows
+    instead of rendering them as orphan top-level conversations (#4293).
+    """
+    archived_by_id = {
+        str(row.get("session_id")): row
+        for row in archived_rows
+        if isinstance(row, dict) and row.get("archived") and row.get("session_id")
+    }
+    if not archived_by_id:
+        return []
+
+    references: list[dict] = []
+    added: set[str] = set()
+    visible_ids = {
+        str(row.get("session_id"))
+        for row in visible_rows
+        if isinstance(row, dict) and row.get("session_id")
+    }
+
+    for row in visible_rows:
+        if not isinstance(row, dict):
+            continue
+        parent_id = str(row.get("parent_session_id") or "").strip()
+        seen: set[str] = set()
+        while parent_id and parent_id not in seen:
+            seen.add(parent_id)
+            if parent_id in visible_ids:
+                break
+            parent = archived_by_id.get(parent_id)
+            if not parent:
+                break
+            if parent_id not in added:
+                references.append(parent)
+                added.add(parent_id)
+            parent_id = str(parent.get("parent_session_id") or "").strip()
+
+    return references
 
 
 def _get_cached_session_list_payload(

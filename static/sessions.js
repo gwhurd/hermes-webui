@@ -3024,6 +3024,7 @@ async function _ensureAllMessagesLoaded() {
 }
 
 let _allSessions = [];  // cached for search filter
+let _sidebarReferenceSessions = [];  // hidden archived ancestor rows used only for nesting/suppression
 let _allSessionsScope = null;  // {profile, allProfiles} the cache was loaded under (#4167)
 let _sessionAttentionSoundPrimed = false;
 const _sessionAttentionSoundState = new Map();
@@ -4169,6 +4170,9 @@ function _applySessionListPayload(sessData, projData){
   const serverSessions=_optimisticallyRemovedSessionIds.size
     ? (sessData.sessions||[]).filter(s=>s&&!_optimisticallyRemovedSessionIds.has(s.session_id))
     : (sessData.sessions||[]);
+  _sidebarReferenceSessions = Array.isArray(sessData.sidebar_reference_sessions)
+    ? sessData.sidebar_reference_sessions
+    : [];
   _reconcileActiveSessionIdleStateFromList(serverSessions);
   _allSessions = _mergeOptimisticFirstTurnSessions(serverSessions);
   // Tag the cache with the scope it was loaded under (active profile +
@@ -4305,6 +4309,7 @@ async function _runRenderSessionListRefresh(opts, _gen){
       renderSessionListFromCache();
     } else {
       _allSessions = [];
+      _sidebarReferenceSessions = [];
       _allSessionsScope = _curScope;
       _clearSessionSourceTabCounts();
       renderSessionListFromCache();
@@ -5988,6 +5993,27 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   };
 }
 
+// Hidden archived-ancestor reference rows (sidebar_reference_sessions) arrive
+// from /api/sessions WITHOUT the client-side project/source scoping that
+// _partitionSidebarSessionRows applies to the visible rows. Appending them to
+// EVERY render unconditionally let an archived parent from a DIFFERENT project
+// (or the other source bucket) enter a project/source-filtered render's
+// suppression context — silently hiding a visible child/fork whose archived
+// ancestor lives outside the current view. Scope the references to the same
+// project + source bucket as the render they feed before using them.
+function _scopedSidebarReferenceRows(isCli){
+  if(typeof _sidebarReferenceSessions==='undefined'||!Array.isArray(_sidebarReferenceSessions)||!_sidebarReferenceSessions.length) return [];
+  return _sidebarReferenceSessions.filter(s=>{
+    if(!s) return false;
+    // Source scope: only references in the same webui/cli bucket as this render.
+    if(_isCliSession(s)!==!!isCli) return false;
+    // Project scope: mirror _partitionSidebarSessionRows exactly.
+    if(_activeProject===NO_PROJECT_FILTER){ if(s.project_id) return false; }
+    else if(_activeProject){ if(s.project_id!==_activeProject) return false; }
+    return true;
+  });
+}
+
 function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw){
   const referenceRows=Array.isArray(referenceSessionsRaw)?referenceSessionsRaw:sessionsRaw;
   return _attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows);
@@ -6035,9 +6061,10 @@ function renderSessionListFromCache(){
     cliSessionsRaw,
   }=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
   const referenceRaw=_sessionSourceFilter==='cli'?cliReferenceRaw:webuiReferenceRaw;
-  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, referenceRaw);
-  const renderedWebuiSessionCount=_renderSidebarRowsFromRawSessions(webuiSessionsRaw, webuiReferenceRaw).length;
-  const renderedCliSessionCount=_renderSidebarRowsFromRawSessions(cliSessionsRaw, cliReferenceRaw).length;
+  const isCliView=_sessionSourceFilter==='cli';
+  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, [...referenceRaw, ..._scopedSidebarReferenceRows(isCliView)]);
+  const renderedWebuiSessionCount=_renderSidebarRowsFromRawSessions(webuiSessionsRaw, [...webuiReferenceRaw, ..._scopedSidebarReferenceRows(false)]).length;
+  const renderedCliSessionCount=_renderSidebarRowsFromRawSessions(cliSessionsRaw, [...cliReferenceRaw, ..._scopedSidebarReferenceRows(true)]).length;
   const webuiSessionTabCount=_sessionSourceTabCount('webui', renderedWebuiSessionCount, renderedCliSessionCount);
   const cliSessionTabCount=_sessionSourceTabCount('cli', renderedWebuiSessionCount, renderedCliSessionCount);
   _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);

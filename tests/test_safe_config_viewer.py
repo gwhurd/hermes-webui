@@ -380,3 +380,23 @@ def test_safe_config_reads_raw_yaml_not_env_expanded(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "_get_config_path", lambda: cfgp)
     text, _n = routes._safe_config_yaml_text()
     assert "sk-ENV-EXPANDED-LEAK-XYZ" not in text  # the expanded secret must NOT leak
+
+
+def test_fragment_and_extended_param_credentials_are_scrubbed():
+    """#5088 round 2 (Codex re-gate): fragment params (#access_token=) and the
+    full credential param vocabulary (x-api-key, access_key, secret_key, ...)
+    must be masked under non-sensitive keys; benign params preserved."""
+    safe = routes._redact_config_for_display({
+        "redirect_url": "https://app/cb#access_token=FRAGTOK123",
+        "u2": "https://h/cb?x-api-key=XAPIKEY123",
+        "u3": "https://h/cb?access_key=ACCESSKEY123&secret_key=SK999",
+        "mixed": "https://h?Token=MIXEDCASE9",
+        "benign": "https://host/path?page=2&view=full#section",
+        "benign2": "https://host/x?api_version=3&key_count=5",
+    })
+    blob = json.dumps(safe)
+    for leak in ("FRAGTOK123", "XAPIKEY123", "ACCESSKEY123", "SK999", "MIXEDCASE9"):
+        assert leak not in blob, f"{leak} leaked"
+    # benign params with credential-substring names must NOT be over-masked
+    assert "page=2" in safe["benign"] and "view=full" in safe["benign"] and "#section" in safe["benign"]
+    assert "api_version=3" in safe["benign2"] and "key_count=5" in safe["benign2"]

@@ -433,13 +433,19 @@ def _config_path_is_sensitive(path: tuple[str, ...]) -> bool:
     return any(fragment in path_text for fragment in _SENSITIVE_CONFIG_KEY_FRAGMENTS)
 
 
-# Sensitive URL query-parameter names whose VALUE must be masked even when the
-# parameter sits inside a string under a non-sensitive config key (e.g.
-# ``callback_url: https://h/cb?token=SECRET``).
+# Sensitive URL query/fragment-parameter names whose VALUE must be masked even
+# when the parameter sits inside a string under a non-sensitive config key (e.g.
+# ``callback_url: https://h/cb?token=SECRET`` or ``...#access_token=SECRET``).
+# Mirrors the credential vocabulary used for key-path redaction, with hyphen
+# variants, so a credential-bearing param can't slip through under a benign key.
 _SENSITIVE_QUERY_PARAM_NAMES = (
     "token", "access_token", "refresh_token", "id_token", "auth_token",
-    "key", "api_key", "apikey", "secret", "client_secret", "password",
-    "passwd", "sig", "signature", "bearer", "code",
+    "oauth_token", "session_token", "session_secret", "session_key",
+    "key", "api_key", "apikey", "api-key", "x-api-key",
+    "access_key", "secret_key", "signing_key", "private_key",
+    "secret", "client_secret", "raw_secret", "secret_input", "key_material",
+    "password", "passwd", "passphrase", "pwd",
+    "sig", "signature", "bearer", "authorization", "code",
 )
 
 
@@ -450,13 +456,15 @@ def _scrub_config_scalar_secrets(text: str) -> str:
     ``api_redact_enabled``), because the path-based key check (#2929) only
     catches values under a sensitive *key name* — it misses a credential that
     is inline inside an otherwise-benign string under a non-sensitive key.
-    Two such vectors leak otherwise (#5088):
+    Three such vectors leak otherwise (#5088):
 
       1. URL / DSN userinfo:  ``scheme://user:PASSWORD@host``  ->  ``user:***@host``
       2. Sensitive query params:  ``...?token=SECRET&x=1``     ->  ``...?token=***&x=1``
+      3. Sensitive fragment params:  ``...#access_token=SECRET`` -> ``...#access_token=***``
 
     Conservative + idempotent: only rewrites the credential span, leaves the
-    rest of the string intact, and is a no-op on strings with no URL shape.
+    rest of the string (host, scheme, benign params) intact, and is a no-op on
+    strings with no URL shape.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -466,11 +474,12 @@ def _scrub_config_scalar_secrets(text: str) -> str:
         r"\1:***@",
         text,
     )
-    # 2) Sensitive query/fragment params:  ?token=SECRET / &key=SECRET  ->  =***
-    if "?" in text or "&" in text or "=" in text:
+    # 2+3) Sensitive query/fragment params (delimiters ? & ; #):
+    #      ?token=SECRET / &key=SECRET / #access_token=SECRET  ->  =***
+    if any(ch in text for ch in "?&;#="):
         param_alt = "|".join(re.escape(p) for p in _SENSITIVE_QUERY_PARAM_NAMES)
         text = re.sub(
-            r"(?i)([?&;](?:" + param_alt + r")=)[^&;#\s]+",
+            r"(?i)([?&;#](?:" + param_alt + r")=)[^&;#\s]+",
             r"\1***",
             text,
         )

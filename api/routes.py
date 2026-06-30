@@ -414,9 +414,12 @@ _SENSITIVE_CONFIG_KEY_FRAGMENTS = (
     # generic secrets
     "client_secret", "secret", "raw_secret", "secret_input",
     "password", "passwd", "passphrase",
-    # tokens (access/refresh/id/auth/bearer/session)
-    "access_token", "refresh_token", "id_token", "auth_token", "token",
-    "bearer", "authorization", "oauth", "auth",
+    # tokens — SPECIFIC names only (bare "token"/"auth" removed: they over-masked
+    # benign knobs like max_tokens / token_budget / author, and bare token:/auth:
+    # is still covered by the exact-segment matcher below). #5088 Opus MUST-FIX.
+    "access_token", "refresh_token", "id_token", "auth_token",
+    "bot_token", "app_token", "bot-token", "app-token", "slack_token",
+    "bearer", "authorization", "oauth",
     # credentials / key material
     "credential", "key_material",
     # sessions / cookies (credential-bearing only)
@@ -427,29 +430,49 @@ _SENSITIVE_CONFIG_KEY_FRAGMENTS = (
 )
 
 
+# Benign keys that CONTAIN a sensitive substring but are NOT credentials — checked
+# (exact dotted-path segment match) before the substring pass so common config
+# knobs survive the viewer. #5088 Opus MUST-FIX (a "copy your config" viewer that
+# blanks max_tokens is broken for its purpose).
+_BENIGN_CONFIG_SEGMENTS = frozenset({
+    "max_tokens", "max_output_tokens", "max_completion_tokens", "max_input_tokens",
+    "min_tokens", "n_tokens", "num_tokens", "token_budget", "token_limit",
+    "tokens", "tokenizer", "max_prompt_tokens", "context_tokens",
+    "author", "authors", "authority", "authentication", "authenticate",
+})
+
+
 # Bare key-segment names that are sensitive ONLY as an EXACT path segment (not a
 # substring) — so ``service.key`` / ``token`` / ``password`` redact, but benign
 # compound names like ``record_key`` / ``theme_key`` / ``token_budget`` do not.
 _SENSITIVE_EXACT_SEGMENTS = frozenset({
     "key", "secret", "token", "password", "passwd", "pwd", "credential",
-    "bearer", "authorization", "passphrase",
+    "bearer", "authorization", "passphrase", "auth",
 })
 
 
 def _config_path_is_sensitive(path: tuple[str, ...]) -> bool:
     """True when ``path`` names a credential-bearing key.
 
-    Two matchers: (a) any fragment in ``_SENSITIVE_CONFIG_KEY_FRAGMENTS`` appears
-    as a SUBSTRING of the dotted path (e.g. ``api_key``, ``client_secret``); and
-    (b) any single path SEGMENT exactly equals a bare sensitive name in
-    ``_SENSITIVE_EXACT_SEGMENTS`` (e.g. ``service.key`` -> the segment ``key`` is
-    sensitive), which catches bare ``key:``/``token:`` without substring-masking
-    benign compound names like ``record_key`` (#5088 round 6).
+    Matchers, in order:
+    (a) any EXACT path segment is a benign-but-sensitive-looking knob
+        (``max_tokens``, ``author``, ...) -> NOT sensitive (early allow, #5088);
+    (b) any single path SEGMENT exactly equals a bare sensitive name
+        (``service.key`` -> the ``key`` segment is sensitive), catching bare
+        ``key:``/``token:``/``auth:`` without substring-masking benign compounds;
+    (c) any fragment in ``_SENSITIVE_CONFIG_KEY_FRAGMENTS`` is a SUBSTRING of the
+        dotted path (e.g. ``api_key``, ``client_secret``, ``bot_token``).
     """
-    path_text = ".".join(path).lower()
-    if any(fragment in path_text for fragment in _SENSITIVE_CONFIG_KEY_FRAGMENTS):
+    segs = [str(seg).lower() for seg in path]
+    # (a) benign allowlist wins — protects max_tokens/author/etc.
+    if any(seg in _BENIGN_CONFIG_SEGMENTS for seg in segs):
+        return False
+    # (b) exact bare sensitive segment
+    if any(seg in _SENSITIVE_EXACT_SEGMENTS for seg in segs):
         return True
-    return any(str(seg).lower() in _SENSITIVE_EXACT_SEGMENTS for seg in path)
+    # (c) specific-name substring match
+    path_text = ".".join(segs)
+    return any(fragment in path_text for fragment in _SENSITIVE_CONFIG_KEY_FRAGMENTS)
 
 
 # Sensitive URL query/fragment-parameter names whose VALUE must be masked even
@@ -546,6 +569,16 @@ def _scrub_config_scalar_secrets(text: str) -> str:
     return text
 
 
+# Common placeholder/sentinel values that frequently appear under sensitive keys
+# (an unset/disabled credential) — never taint these globally (#5088 Opus SHOULD-FIX).
+_TAINT_SENTINEL_VALUES = frozenset({
+    "changeme", "change-me", "change_me", "password", "secret", "default",
+    "disabled", "enabled", "none", "null", "true", "false", "example",
+    "placeholder", "your-api-key", "your_api_key", "todo", "unset", "notset",
+    "not-set", "redacted", "[redacted]",
+})
+
+
 def _collect_sensitive_scalar_values(value, *, path: tuple[str, ...] = (), out: set | None = None) -> set:
     """Collect every non-trivial scalar value that appears under a sensitive key
     path, so the display pass can redact the SAME value wherever else it appears.
@@ -563,9 +596,16 @@ def _collect_sensitive_scalar_values(value, *, path: tuple[str, ...] = (), out: 
         for v in value:
             _collect_sensitive_scalar_values(v, path=path, out=out)
     elif _config_path_is_sensitive(path):
-        # Only taint substantial string secrets — short/empty/numeric values are
-        # too collision-prone to redact globally (would mask benign matches).
-        if isinstance(value, str) and len(value) >= 6:
+        # Only taint substantial, secret-LOOKING string values. A short value, or a
+        # common placeholder/sentinel ("changeme", "disabled", "default", ...), is
+        # too collision-prone to redact globally — it would mask every benign reuse
+        # of that word elsewhere in the config. #5088 Opus SHOULD-FIX: require
+        # length >= 12 AND not a known sentinel.
+        if (
+            isinstance(value, str)
+            and len(value) >= 12
+            and value.strip().lower() not in _TAINT_SENTINEL_VALUES
+        ):
             out.add(value)
     return out
 

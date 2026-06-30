@@ -508,3 +508,51 @@ def test_bare_key_segment_and_percent_encoded_params_scrubbed(monkeypatch):
     # benign compound 'key' names NOT over-masked
     assert safe["ui"]["record_key"] == "Ctrl+R"
     assert safe["ui"]["theme_key"] == "dark"
+
+
+def test_benign_token_auth_knobs_survive_opus_mustfix(monkeypatch):
+    """#5088 Opus MUST-FIX: bare 'token'/'auth' substring fragments over-masked
+    core non-secret knobs (max_tokens, token_budget, author). Those must survive
+    the viewer while real credential names (bot_token, app_token, bare token:/auth:)
+    still redact."""
+    monkeypatch.setattr(routes, "_redact_text", lambda t, *, _enabled=None: t)
+    safe = routes._redact_config_for_display({
+        "max_tokens": 4096,
+        "agent": {"max_tokens": 8192, "token_budget": 200000},
+        "providers": {"openai": {"max_output_tokens": 2048, "api_key": "sk-REALKEY123456"}},
+        "author": "Jane Doe",
+        "authority": "https://issuer.example",
+        "platforms": {"telegram": {"bot_token": "123:ABCREALBOTTOKEN"}},
+        "slack": {"app_token": "xapp-REALAPPTOKEN"},
+        "svc": {"token": "BARETOKENSECRETVAL"},
+        "x": {"auth": "BAREAUTHSECRETVAL"},
+    })
+    blob = json.dumps(safe)
+    # benign knobs survive
+    assert safe["max_tokens"] == 4096
+    assert safe["agent"]["max_tokens"] == 8192
+    assert safe["agent"]["token_budget"] == 200000
+    assert safe["providers"]["openai"]["max_output_tokens"] == 2048
+    assert safe["author"] == "Jane Doe"
+    assert safe["authority"] == "https://issuer.example"
+    # real credentials still redact
+    for leak in ("sk-REALKEY123456", "ABCREALBOTTOKEN", "REALAPPTOKEN", "BARETOKENSECRETVAL", "BAREAUTHSECRETVAL"):
+        assert leak not in blob, f"{leak} leaked"
+
+
+def test_taint_skips_sentinels_opus_shouldfix(monkeypatch):
+    """#5088 Opus SHOULD-FIX: placeholder/sentinel values ('changeme', short
+    values) under a sensitive key must NOT taint benign reuse elsewhere, while a
+    genuine long secret shared via YAML alias still taints everywhere."""
+    monkeypatch.setattr(routes, "_redact_text", lambda t, *, _enabled=None: t)
+    safe = routes._redact_config_for_display({
+        "auth_block": {"client_secret": "changeme"},
+        "ui": {"mode": "changeme"},  # sentinel reuse -> must survive
+    })
+    assert safe["ui"]["mode"] == "changeme"
+    # real long secret still taints across an alias
+    safe2 = routes._redact_config_for_display({
+        "auth_block": {"password": "correct-horse-battery-staple"},
+        "notes": {"x": "correct-horse-battery-staple"},
+    })
+    assert safe2["notes"]["x"] == "[REDACTED]"

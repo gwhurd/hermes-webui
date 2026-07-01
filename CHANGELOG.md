@@ -9,6 +9,8 @@ _No unreleased changes. Entries are moved into their version block when a releas
 
 ### Fixed
 
+- **No more scroll jump-back on mobile while messages load.** When the app realigns the viewport after loading older messages, mobile browsers no longer double-compensate the scroll position (their native overflow-anchor fighting the app's own scroll write), which caused a visible jump. Desktop behavior is unchanged. (#5338)
+
 - **No more white flicker/flash while the assistant streams on light themes.** Live token-by-token markdown updates no longer inherit the global dark/light `color`/`background` transition, so the streaming turn paints instantly instead of briefly fading on each token. Theme-switch transitions elsewhere are unchanged. (#5328)
 
 - **No more false "Clarify endpoint unavailable. Please restart server." toast.** The clarify-pending poll used to fire the restart-server warning on any error whose message merely contained "404"/"not found" — so a harmless stale `Session not found` from a just-switched profile mis-triggered it even though the clarify endpoint was fine. The poll now branches on the structured HTTP status: a session-scoped 404 is treated as a stale poll (silently stops), and the restart warning fires only on a genuine missing-route 404. Interrupt provenance is also now labeled (explicit Stop vs stream-lifecycle) for clearer settlement. (#5345)

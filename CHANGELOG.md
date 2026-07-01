@@ -9,6 +9,10 @@ _No unreleased changes. Entries are moved into their version block when a releas
 
 ### Fixed
 
+- **WebUI no longer grows memory without bound / crashes after hours of uptime.** The in-memory session cache is now safely bounded (`webui.sessions_cache_max` in config.yaml, default 300) with data-safe eviction (never evicts a streaming/pending/not-yet-persisted session) + lazy reload from disk. Fixes the memory-growth crash cluster on long-running self-hosted installs. (#4765, #2233, #4633)
+- **Per-provider reasoning-effort levels can be configured in `config.yaml`** via a `reasoning_efforts` map under a provider entry; routes that must never expose a reasoning toggle (nested Gemini image/embedding) stay denied. Thanks @CharlesMcq. (#5313)
+- **More complete Chinese (zh-CN) localization** — busy-placeholder hints, Kanban/skills/runtime labels, provider cost-budget controls and more are now translated; interpolation tokens preserved, no keys dropped. Thanks @Loukky. (#5335)
+
 - **After a container restart, a stale user message is no longer permanently prepended to every later turn.** WebUI's state.db reconciliation dedup key now strips the workspace prefix for user messages (matching the streaming-side identity), so a state.db row (`[Workspace::v1: /workspace]\n<text>`) and its bare-text sidecar row are recognized as the SAME message instead of appended as a duplicate that the agent then merges into a permanent composite. Fixes the post-restart contaminated/out-of-order messages. (#5339)
 
 - **Silent server crashes now leave a diagnostic instead of vanishing.** Enabled `faulthandler` and installed thread/main-thread exception hooks plus an exit audit, so an uncaught handler-thread exception or a native fault is logged with a traceback rather than the process disappearing with no trace (previously a ~9-16h silent exit). Diagnostic hardening; stdlib-only, startup-only, no request-path change. (#4633)

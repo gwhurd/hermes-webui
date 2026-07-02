@@ -1529,7 +1529,10 @@ function _mountMermaidViewer(svgEl, options = {}) {
   }
 
   function _minScale(){
-    if(mode === 'lightbox') return Math.min(_MERMAID_VIEWER_MIN_SCALE, _rawFitScale(_viewportSize()));
+    // Lightbox keeps master's flat minimum (unchanged zoom-out floor / fit
+    // bounds). Only inline mode uses the readable-height-derived minimum so a
+    // short inline viewport can't shrink the diagram below usability (#5434).
+    if(mode === 'lightbox') return _MERMAID_VIEWER_MIN_SCALE;
     return Math.min(_MERMAID_VIEWER_MIN_SCALE, _inlineViewportHeight() / Math.max(1, box.height));
   }
 
@@ -1671,20 +1674,19 @@ function _mountMermaidViewer(svgEl, options = {}) {
   toolbar.appendChild(_createMermaidViewerButton('Zoom in', 'zoomIn', _zoomIn));
   toolbar.appendChild(_createMermaidViewerButton('Zoom out', 'zoomOut', _zoomOut));
   toolbar.appendChild(_createMermaidViewerButton('Reset view', 'reset', _resetViewer));
-  if(mode === 'lightbox'){
-    toolbar.appendChild(_createMermaidViewerButton('Fit to screen', 'fit', _fitViewer));
-  } else {
+  toolbar.appendChild(_createMermaidViewerButton('Fit to screen', 'fit', _fitViewer));
+  if(mode === 'inline'){
     toolbar.appendChild(_createMermaidViewerButton('Fullscreen', 'fullscreen', openLightbox));
   }
 
   if(mode === 'lightbox'){
-    const envelope = _viewportFallbackSize();
-    const fitScale = Math.max(_minScale(), Math.min(_MERMAID_VIEWER_MAX_SCALE, _rawFitScale(envelope)));
-    const readableHeight = Math.max(_MERMAID_VIEWER_INLINE_MIN_HEIGHT, Math.min(envelope.height, Math.round(box.height)));
-    const readableScale = Math.min(_MERMAID_VIEWER_MAX_SCALE, readableHeight / Math.max(1, box.height));
-    state.scale = Math.max(fitScale, readableScale);
-    viewport.style.width = Math.max(1, Math.round(envelope.width)) + 'px';
-    viewport.style.height = Math.max(1, Math.round(envelope.height)) + 'px';
+    // Preserve master's lightbox initialization exactly: fit-to-screen scale
+    // and a viewport envelope sized to the fitted diagram. The inline readable-
+    // height sizing below must NOT leak into lightbox mode (#5434 gate finding).
+    const initialFit = _fitScale();
+    state.scale = initialFit;
+    viewport.style.width = Math.max(1, Math.round(box.width * initialFit)) + 'px';
+    viewport.style.height = Math.max(1, Math.round(box.height * initialFit)) + 'px';
   } else {
     const initialHeight = _inlineViewportHeight();
     const readableScale = initialHeight / Math.max(1, box.height);

@@ -347,7 +347,7 @@ def test_inline_viewer_mounts_toolbar_and_shell(_driver_path):
     })
 
     assert result["className"] == "mermaid-viewer mermaid-viewer--inline"
-    assert result["labels"] == ["Zoom in", "Zoom out", "Reset view", "Fullscreen"]
+    assert result["labels"] == ["Zoom in", "Zoom out", "Reset view", "Fit to screen", "Fullscreen"]
     assert result["canvasWidth"] == "480px"
     assert result["viewportWidth"] == "100%"
     assert result["hasInlineFullscreen"] is True
@@ -410,7 +410,7 @@ def test_drag_suppresses_accidental_lightbox_open(_driver_path):
 def test_lightbox_mode_uses_same_viewer_helper_without_fullscreen(_driver_path):
     result = _run_node(_driver_path, {"scenario": "fullscreen", "options": {"mode": "inline"}})
 
-    assert result["inlineLabels"] == ["Zoom in", "Zoom out", "Reset view", "Fullscreen"]
+    assert result["inlineLabels"] == ["Zoom in", "Zoom out", "Reset view", "Fit to screen", "Fullscreen"]
     assert result["lightboxLabels"] == ["Zoom in", "Zoom out", "Reset view", "Fit to screen"]
     assert result["opens"] == ["inline-lightbox"]
     assert result["lightboxClassName"] == "mermaid-viewer mermaid-viewer--lightbox"
@@ -426,13 +426,14 @@ def test_lightbox_wide_diagram_fits_modal_envelope(_driver_path):
         "options": {"mode": "inline"},
     })
 
+    # Lightbox keeps master's contract: the flat min-scale floor (0.25) governs
+    # both mount and fit (a very wide diagram bottoms out at the floor), and the
+    # viewport is sized to the fitted diagram (box * scale). The inline readable-
+    # height sizing must NOT leak into lightbox mode (#5434 gate finding).
     assert result["mode"] == "lightbox"
-    expected_max_width = int(360 * 0.9)
-    expected_max_height = int(640 * 0.9)
-    assert _px(result["initialViewportWidth"]) == expected_max_width
-    assert _px(result["initialViewportHeight"]) == expected_max_height
-    assert result["initialScale"] > result["fitScale"]
-    assert result["initialScale"] > 0.25
-    assert result["fitScale"] < 0.1
-    assert _px(result["viewportWidthAfterFit"]) == expected_max_width
-    assert _px(result["viewportHeightAfterFit"]) == expected_max_height
+    assert result["initialScale"] == 0.25
+    assert result["fitScale"] == 0.25
+    assert _px(result["initialViewportWidth"]) == round(4000 * result["initialScale"])
+    assert _px(result["initialViewportHeight"]) == round(320 * result["initialScale"])
+    assert _px(result["viewportWidthAfterFit"]) == round(4000 * result["fitScale"])
+    assert _px(result["viewportHeightAfterFit"]) == round(320 * result["fitScale"])

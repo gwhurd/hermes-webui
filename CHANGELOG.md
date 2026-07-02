@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **The busy-time send behavior is now called "Default message mode," and new installs default to Steer.** The Settings → Preferences control formerly labeled "Busy input mode" is renamed to "Default message mode," and a fresh install now defaults to **Steer** (inject a mid-turn correction without interrupting) instead of Queue. Your existing choice is preserved — if you ever saved settings, your current mode (Queue/Interrupt/Steer) is migrated as-is and unchanged; only never-configured installs pick up the new Steer default. The saved preference still survives a reload or a brief server outage (the localStorage mirror from the previous release is intact). Thanks @rodboev. (#5162, #5145)
+
 ### Fixed
 
 - **The sidebar recovers on its own after a brief server blip during a profile switch.** If the backend returned a transient 502/503/504 (e.g. an nginx→backend restart window) on a warm session-list refresh — a profile switch, tab focus, or reconnect — the sidebar gave up on the first try and sat on the previous profile's list until you hard-reloaded. The idempotent session-list fetch now retries those transient upstream statuses on every refresh (not just the first cold load), so it heals itself without a Ctrl+F5. Thanks @weidzhou for the report and root-cause. (#5394)

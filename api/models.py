@@ -3291,14 +3291,34 @@ def get_session(sid, metadata_only=False):
     raise KeyError(sid)
 
 
-def _compression_recovery_child_matches(session, source_session_id: str, action: str) -> bool:
+_COMPRESSION_RECOVERY_PROFILE_UNSET = object()
+
+
+def _compression_recovery_child_matches(
+    session,
+    source_session_id: str,
+    action: str,
+    source_profile=_COMPRESSION_RECOVERY_PROFILE_UNSET,
+) -> bool:
+    if source_profile is not _COMPRESSION_RECOVERY_PROFILE_UNSET:
+        try:
+            from api.profiles import _profiles_match
+            if not _profiles_match(getattr(session, "profile", None), source_profile):
+                return False
+        except Exception:
+            logger.debug("Failed to profile-check compression recovery session", exc_info=True)
+            return False
     return (
         str(getattr(session, "compression_recovery_source_session_id", "") or "").strip() == source_session_id
         and str(getattr(session, "compression_recovery_action", "") or "").strip() == action
     )
 
 
-def find_compression_recovery_session(source_session_id: str, action: str):
+def find_compression_recovery_session(
+    source_session_id: str,
+    action: str,
+    source_profile=_COMPRESSION_RECOVERY_PROFILE_UNSET,
+):
     """Return an existing focused recovery child for ``source_session_id``.
 
     The recovery-start endpoint is a retryable UI action. A persisted marker on
@@ -3320,7 +3340,7 @@ def find_compression_recovery_session(source_session_id: str, action: str):
             sid = str(getattr(session, "session_id", "") or "").strip()
             if sid:
                 seen_ids.add(sid)
-            if _compression_recovery_child_matches(session, source_sid, recovery_action):
+            if _compression_recovery_child_matches(session, source_sid, recovery_action, source_profile):
                 matches.append(session)
     except Exception:
         logger.debug("Failed to scan cached compression recovery sessions", exc_info=True)
@@ -3337,7 +3357,7 @@ def find_compression_recovery_session(source_session_id: str, action: str):
         except Exception:
             logger.debug("Failed to inspect compression recovery session %s", sid, exc_info=True)
             continue
-        if not meta or not _compression_recovery_child_matches(meta, source_sid, recovery_action):
+        if not meta or not _compression_recovery_child_matches(meta, source_sid, recovery_action, source_profile):
             continue
         try:
             matches.append(get_session(sid))

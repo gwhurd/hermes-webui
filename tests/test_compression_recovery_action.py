@@ -221,13 +221,43 @@ def test_recovery_start_creates_focused_linked_session(monkeypatch, tmp_path):
     assert new_session["model"] == "gpt-4o"
     assert new_session["model_provider"] == "openai"
     assert new_session["messages"] == []
+    assert new_session["session_source"] == "fork"
 
     saved = json.loads((session_dir / f"{new_session['session_id']}.json").read_text(encoding="utf-8"))
     assert saved["parent_session_id"] == sid
+    assert saved["session_source"] == "fork"
     assert saved["context_messages"] == []
     assert saved["compression_recovery_source_session_id"] == sid
     assert saved["compression_recovery_action"] == "start_focused_continuation"
     assert compression_recovery_payload_for_session(session)["recommended_action"] == "start_focused_continuation"
+
+
+def test_recovery_child_does_not_merge_parent_transcript(monkeypatch, tmp_path):
+    _isolate_sessions(monkeypatch, tmp_path)
+    sid = "recoverysrcisolate"
+    session = Session(
+        session_id=sid,
+        title="Long task",
+        workspace=str(tmp_path),
+        model="gpt-4o",
+        messages=[
+            {"role": "user", "content": "long task"},
+            {"role": "assistant", "content": "compression exhausted"},
+        ],
+    )
+    stamp_compression_exhausted_recovery(session, message="Context length exceeded.")
+    session.save()
+    models.SESSIONS[sid] = session
+    routes.SESSIONS[sid] = session
+
+    handler = _JSONHandler()
+    routes._handle_session_compression_recovery_start(handler, {"session_id": sid})
+    payload = _payload(handler)
+    child_id = payload["session"]["session_id"]
+    child = models.SESSIONS[child_id]
+
+    assert child.messages == []
+    assert routes._merged_webui_lineage_messages_for_display(child) == []
 
 
 def test_recovery_start_reuses_existing_focused_session(monkeypatch, tmp_path):
@@ -277,6 +307,54 @@ def test_recovery_start_reuses_existing_focused_session(monkeypatch, tmp_path):
     assert len(recovery_children) == 1
 
 
+def test_recovery_start_ignores_existing_child_from_other_profile(monkeypatch, tmp_path):
+    session_dir = _isolate_sessions(monkeypatch, tmp_path)
+    sid = "recoverysrcprofile"
+    source = Session(
+        session_id=sid,
+        title="Long task",
+        workspace=str(tmp_path),
+        model="gpt-4o",
+        profile="default",
+        messages=[{"role": "user", "content": "long task"}],
+    )
+    stamp_compression_exhausted_recovery(source, message="Context length exceeded.")
+    source.save()
+    foreign_child = Session(
+        session_id="foreignchild1",
+        title="Foreign focused continuation",
+        workspace=str(tmp_path),
+        model="gpt-4o",
+        profile="other-profile",
+        messages=[],
+        parent_session_id=sid,
+        compression_recovery_source_session_id=sid,
+        compression_recovery_action="start_focused_continuation",
+    )
+    foreign_child.save()
+    models.SESSIONS.clear()
+    routes.SESSIONS.clear()
+    models.SESSIONS[sid] = source
+    routes.SESSIONS[sid] = source
+
+    handler = _JSONHandler()
+    routes._handle_session_compression_recovery_start(handler, {"session_id": sid})
+    payload = _payload(handler)
+
+    assert handler.status == 200
+    assert payload["session"]["session_id"] != "foreignchild1"
+    assert payload["session"]["profile"] == "default"
+
+    recovery_children = []
+    for path in session_dir.glob("*.json"):
+        if path.name.startswith("_"):
+            continue
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("compression_recovery_source_session_id") == sid:
+            recovery_children.append(data)
+    assert {child["profile"] for child in recovery_children} == {"default", "other-profile"}
+
+
 def test_recovery_metadata_is_persisted_and_exposed_in_compact_session():
     session = Session(session_id="recovermeta1", title="x", messages=[])
     recovery = stamp_compression_exhausted_recovery(session, message="Context length exceeded.")
@@ -320,6 +398,7 @@ def test_compression_recovery_ui_wires_card_action_and_send_intercept():
     assert "data-compression-recovery-card=\"1\"" in ui
     assert "api('/api/session/compression-recovery/start'" in ui
     assert "Compression recovery did not return a session." in ui
+    assert "const sid=String(recovery.source_session_id||sessionId||'')" in ui
     assert "function shouldInterceptCompressionRecoveryContinuation" in ui
     assert "shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)" in messages
     assert "_compressionRecovery:recovery||undefined" in messages

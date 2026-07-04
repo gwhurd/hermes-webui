@@ -8123,6 +8123,11 @@ def _merged_webui_lineage_messages_for_display(session, messages=None) -> list:
     parent_id = str(getattr(session, "parent_session_id", "") or "").strip()
     if not parent_id:
         return primary_messages
+    if (
+        str(getattr(session, "compression_recovery_source_session_id", "") or "").strip()
+        and str(getattr(session, "compression_recovery_action", "") or "").strip()
+    ):
+        return primary_messages
     source = str(getattr(session, "session_source", "") or "").strip().lower()
     relationship = str(getattr(session, "relationship_type", "") or "").strip().lower()
     if source == "fork" or relationship == "child_session":
@@ -19851,7 +19856,8 @@ def _handle_session_compression_recovery_start(handler, body):
 
     created = False
     with _COMPRESSION_RECOVERY_START_LOCK:
-        copied_session = find_compression_recovery_session(sid, action)
+        source_profile = getattr(source, "profile", None)
+        copied_session = find_compression_recovery_session(sid, action, source_profile=source_profile)
         if copied_session is None:
             title = str(getattr(source, "title", None) or "Untitled").strip() or "Untitled"
             if not title.endswith(" (focused continuation)"):
@@ -19868,6 +19874,7 @@ def _handle_session_compression_recovery_start(handler, body):
                 archived=False,
                 project_id=getattr(source, "project_id", None),
                 profile=getattr(source, "profile", None),
+                session_source="fork",
                 personality=getattr(source, "personality", None),
                 enabled_toolsets=copy.deepcopy(getattr(source, "enabled_toolsets", None)),
                 context_length=getattr(source, "context_length", None),

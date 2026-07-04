@@ -422,7 +422,7 @@ function _compressionRecoveryHtml(recovery, sessionId){
   if(String(recovery.terminal_state||'')!=='compression_exhausted') return '';
   const action=String(recovery.recommended_action||'');
   if(action!=='start_focused_continuation') return '';
-  const sid=String(sessionId||recovery.source_session_id||'');
+  const sid=String(recovery.source_session_id||sessionId||'');
   const title=String(recovery.title||'Context compression exhausted');
   const summary=String(recovery.summary||'Start a focused continuation, then describe the next narrow task.');
   const actionLabel=String(recovery.action_label||'Start focused continuation');

@@ -10803,7 +10803,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     node=_decorateTransparentEventRow(buildToolCard(toolCall),{
       type:'tool',
       name:toolCall&&toolCall.name,
-      status:_transparentToolStatus(toolCall,true),
+      status:_transparentToolStatus(toolCall,settled),
       toolCall,
       ...meta,
     });

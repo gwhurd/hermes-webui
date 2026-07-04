@@ -13707,8 +13707,48 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         sid = body["session_id"]
         with _get_session_agent_lock(sid):
-            s.messages = []
+            had_sidecar_messages = bool(s.messages or [])
+            # Clear is a full truncate-to-empty: route through the SAME helper the
+            # /api/session/truncate handler uses (single source of truth) so the
+            # display + context arrays are emptied AND the truncation watermark is
+            # set via _truncation_watermark_for([]) == 0.0 — the #2914
+            # truncate-to-empty sentinel that blocks state.db replay. Before this,
+            # /clear wiped s.messages but left the watermark unset, so the
+            # append-only state.db merge treated it as "keep everything" and the
+            # cleared history resurrected on the next /api/session read (#5532).
+            from api.session_ops import truncate_session_at_keep
+            truncate_session_at_keep(s, 0)
             s.tool_calls = []
+            # A compressed-continuation child keeps its archived transcript in a
+            # parent sidecar marked pre_compression_snapshot;
+            # _webui_sidecar_lineage_messages_for_display() stitches that parent
+            # back with truncation_watermark=None, so the 0.0 sentinel on the
+            # CHILD does NOT stop the parent from resurrecting the cleared history
+            # on refresh. Detach the compression lineage (#5532/#5553) — but ONLY
+            # when the parent is actually a pre_compression_snapshot; a genuine
+            # fork parent (session_source="fork" from /api/session/branch) must
+            # keep its link so the child still nests + shows "Forked from"
+            # (sessions.js:5720/5964/7105). Dropping every parent broke that
+            # (#5532 Codex gate).
+            _parent_sid = getattr(s, "parent_session_id", None)
+            if _parent_sid:
+                _parent_is_compression_snapshot = False
+                try:
+                    _parent = get_session(_parent_sid, metadata_only=True)
+                    _parent_is_compression_snapshot = bool(
+                        getattr(_parent, "pre_compression_snapshot", False)
+                    )
+                except Exception:
+                    _parent_is_compression_snapshot = False
+                if _parent_is_compression_snapshot:
+                    s.parent_session_id = None
+                    s.compression_anchor_visible_idx = None
+                    s.compression_anchor_message_key = None
+            s.active_stream_id = None
+            s.pending_user_message = None
+            s.pending_attachments = []
+            s.pending_started_at = None
+            s.pending_user_source = None
             # Reset the title via the rename helper so clearing a manually-named
             # session also clears manual_title/llm_title_generated — otherwise the
             # reused session keeps its manual-title protection and never auto-names
@@ -13716,6 +13756,27 @@ def handle_post(handler, parsed) -> bool:
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, "Untitled")
             s.save()
+            persisted_clear = False
+            try:
+                persisted = json.loads(s.path.read_text(encoding="utf-8"))
+                persisted_clear = (
+                    persisted.get("messages") == []
+                    and persisted.get("context_messages") == []
+                    and persisted.get("truncation_watermark") == 0.0
+                    and persisted.get("truncation_boundary") == 0.0
+                    and persisted.get("active_stream_id") is None
+                    and persisted.get("pending_user_message") is None
+                    and persisted.get("pending_attachments") == []
+                    and persisted.get("pending_started_at") is None
+                    and persisted.get("pending_user_source") is None
+                )
+            except (OSError, json.JSONDecodeError, ValueError):
+                logger.warning("session clear could not verify persisted empty state for %s", sid, exc_info=True)
+            if had_sidecar_messages and persisted_clear:
+                try:
+                    s.path.with_suffix('.json.bak').unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.

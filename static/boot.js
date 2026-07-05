@@ -2994,7 +2994,9 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     // .composer-divider (#5451) sees #btnVoiceMode final display even
     // when a server/localStorage sync path flipped the pref between
     // module init and settings-load completion (round-2 SILENT race).
-    if(typeof _applyVoiceModePref==='function') _applyVoiceModePref();
+    // Note: must use window._applyVoiceModePref — the bare name is
+    // closure-local to the voice-mode IIFE and not visible here.
+    if(typeof window._applyVoiceModePref==='function') window._applyVoiceModePref();
     _applyComposerFooterVisibilitySettings();
     if(typeof window._applyVoiceModePref==='function') window._applyVoiceModePref();
     // TTS: apply enabled state on boot so buttons show/hide correctly (#499)
@@ -3053,7 +3055,9 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     // a server/localStorage sync path flipped the pref between module init
     // and settings-load completion (round-2 SILENT race fix; safe no-op on
     // the failure-fallback path because _applyVoiceModePref is idempotent).
-    if(typeof _applyVoiceModePref==='function') _applyVoiceModePref();
+    // Note: must use window._applyVoiceModePref — the bare name is
+    // closure-local to the voice-mode IIFE and not visible here.
+    if(typeof window._applyVoiceModePref==='function') window._applyVoiceModePref();
     _applyComposerFooterVisibilitySettings();
     if(typeof _applyTtsEnabled==='function') _applyTtsEnabled(localStorage.getItem('hermes-tts-enabled')==='true');
   }

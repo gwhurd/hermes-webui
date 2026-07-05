@@ -3151,8 +3151,15 @@
   }
 
   @media (max-width: 640px){
-    .panel-head-btn.mobile-sidebar-close{display:inline-flex!important;right:4px;top:calc(4px + var(--app-titlebar-safe-top));width:44px!important;height:44px!important;min-width:44px;min-height:44px;line-height:1;overflow:hidden;}
-    .panel-head-btn.mobile-sidebar-close svg{width:18px;height:18px;display:block;}
+    /* Match the close (X) glyph to the new-conversation (+) button's 14px size
+       (previously 18px — the only 18px panel-head icon, so the X read visibly
+       larger than the +) and align its vertical center with the +. The + sits
+       centered in the 41px panel-head row (center ~20px from the header top); the
+       X is a 44px box, so top:calc(safe-top - 2px) centers it on the same row
+       ((41-44)/2 ≈ -2) while keeping the existing safe-area offset so it still
+       clears the notch. No extra drawer spacing. 44x44 tap target kept for touch. */
+    .panel-head-btn.mobile-sidebar-close{display:inline-flex!important;align-items:center;justify-content:center;right:4px;top:calc(var(--app-titlebar-safe-top) - 2px);width:44px!important;height:44px!important;min-width:44px;min-height:44px;line-height:1;overflow:hidden;}
+    .panel-head-btn.mobile-sidebar-close svg{width:14px;height:14px;display:block;}
     /* Keep mobile send-button reveal motion off: avoids 0.18s pop-in in tight composer layouts,
        which can jitter the 44px hit area while typing/scrolling. */
     .send-btn.visible{animation:none;opacity:1;transform:none;}

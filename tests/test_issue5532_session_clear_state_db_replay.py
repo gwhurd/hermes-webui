@@ -123,6 +123,7 @@ def test_session_clear_persists_empty_context_and_blocks_state_db_replay(monkeyp
     assert loaded.pending_attachments == []
     assert loaded.pending_started_at is None
     assert loaded.pending_user_source is None
+    assert loaded.clear_generation
     assert loaded.title == "Untitled"
 
     persisted = json.loads(loaded.path.read_text(encoding="utf-8"))
@@ -135,6 +136,7 @@ def test_session_clear_persists_empty_context_and_blocks_state_db_replay(monkeyp
     assert persisted["pending_attachments"] == []
     assert persisted["pending_started_at"] is None
     assert persisted["pending_user_source"] is None
+    assert persisted["clear_generation"] == loaded.clear_generation
 
     state_db_messages = [
         _msg("user", "state prompt", 100.0, "s-u1"),
@@ -192,6 +194,12 @@ def test_clear_sentinel_does_not_suppress_later_backup_recovery(tmp_path):
         "context_messages": [],
         "truncation_watermark": 0.0,
         "truncation_boundary": 0.0,
+        "active_stream_id": None,
+        "pending_user_message": None,
+        "pending_attachments": [],
+        "pending_started_at": None,
+        "pending_user_source": None,
+        "clear_generation": "clear-post",
     }
     backup = {
         **live,
@@ -241,6 +249,7 @@ def test_clearing_empty_live_session_preserves_existing_recoverable_backup(monke
 
     assert captured["status"] == 200
     assert session.path.with_suffix(".json.bak").exists()
+    assert Session.load(sid).clear_generation is None
     assert inspect_session_recovery_status(session.path)["recommend"] == "restore"
     recovered = recover_session(session.path)
     assert recovered["restored"] is True

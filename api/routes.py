@@ -31,7 +31,7 @@ import socket as _socket
 from collections import defaultdict
 from pathlib import Path
 from contextlib import closing
-from urllib.parse import parse_qs, quote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 from api.agent_sessions import (
@@ -9237,6 +9237,37 @@ def _safe_login_redirect_path(raw_path: str | None) -> str:
     if path[1:2] in {"/", "\\"}:
         return "/"
     if re.search(r"[\x00-\x1f\x7f\s]", path):
+        return "/"
+    # #5578: reject a `next` that points back at the login page, so an
+    # expired-auth bounce on the login page can't feed the redirect its own
+    # address and grow the URL exponentially. Length cap is belt-and-suspenders:
+    # a legitimate app path is never this long.
+    if len(path) > 2048:
+        return "/"
+    # Detect a login-route target even through nested percent-encoding: a nested
+    # login-redirect chain looks like `/session/login%3Fnext%3D...`, where the
+    # `?` separating the path from the query is itself encoded, so a plain
+    # split("?") wouldn't isolate the real path. Fully decode (bounded) and check
+    # the leading PATH of EVERY decode level, including the final fully-decoded
+    # form. Only collapse login-route chains — a legitimate non-login path that
+    # merely carries its own `next=` query key (e.g. `/admin?action=foo&next=/x`)
+    # must still round-trip (regression guarded by test_v050258_opus_followups.py).
+    _probe = path
+    for _ in range(8):
+        _path_only = _probe.split("?", 1)[0].split("#", 1)[0].split("&", 1)[0].rstrip("/")
+        if _path_only.endswith("/login") or _path_only == "/login":
+            return "/"
+        _decoded = unquote(_probe)
+        if _decoded == _probe:
+            break
+        _probe = _decoded
+    else:
+        # Loop exhausted the cap while STILL decoding (pathologically deep
+        # encoding): check the final decoded form too, then fail closed — an
+        # 8-level-deep encoded value is never a legitimate redirect.
+        _path_only = _probe.split("?", 1)[0].split("#", 1)[0].split("&", 1)[0].rstrip("/")
+        if _path_only.endswith("/login") or _path_only == "/login":
+            return "/"
         return "/"
     return path
 

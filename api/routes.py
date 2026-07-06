@@ -9035,6 +9035,7 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "_compression_segment_count",
     "_lineage_collapsed_count",
     "_parent_lineage_root_id",
+    "_parent_lineage_tip_id",
     "_cross_surface_child_session",
     "match_type",
     "match_preview",

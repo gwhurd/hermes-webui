@@ -8893,8 +8893,10 @@ from api.streaming import (
 )
 from api.gateway_chat import _run_gateway_chat_streaming, webui_gateway_chat_enabled
 from api.run_journal import (
+    _parse_run_journal_event_id as _shared_parse_run_journal_event_id,
     find_run_summary,
     read_run_events,
+    read_session_run_events,
     stale_interrupted_event,
 )
 from api.todo_state import attach_todo_state
@@ -12433,6 +12435,10 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == '/api/sessions/events':
         return _handle_session_events_stream(handler)
 
+    session_events_session_id = _session_events_path_session_id(parsed.path)
+    if session_events_session_id is not None:
+        return _handle_session_sse_stream_for_session(handler, parsed, session_events_session_id)
+
     if parsed.path == "/api/media":
         return _handle_media(handler, parsed)
 
@@ -15852,19 +15858,46 @@ def _sse_with_id(handler, event, data, event_id=None):
     _sse(handler, event, data)
 
 
-def _parse_run_journal_event_id(raw: str | None) -> tuple[str | None, int | None]:
+def _session_events_path_session_id(path: str | None) -> str | None:
+    path = str(path or "")
+    parts = path.strip("/").split("/")
+    if len(parts) != 4:
+        return None
+    if parts[0] != "api" or parts[1] != "sessions" or parts[3] != "events":
+        return None
+    sid = str(parts[2] or "").strip()
+    return sid or None
+
+
+def _session_events_resume_event_id(handler, parsed) -> str | None:
+    headers = getattr(handler, "headers", None)
+    raw = None
+    if headers is not None:
+        try:
+            raw = headers.get("Last-Event-ID")
+        except Exception:
+            raw = None
     raw = str(raw or "").strip()
-    if not raw:
-        return None, None
-    if ":" in raw:
-        run_id, tail = raw.rsplit(":", 1)
-    else:
-        run_id, tail = None, raw
+    if raw:
+        return raw
+    qs = parse_qs(getattr(parsed, "query", "") or "")
+    raw = str(qs.get("after_event_id", [None])[0] or "").strip()
+    return raw or None
+
+
+def _session_snapshot_payload(session, *, active_stream_id: str | None = None) -> dict:
     try:
-        seq = max(0, int(tail))
-    except (TypeError, ValueError):
-        return run_id or None, None
-    return run_id or None, seq
+        payload = session.compact(
+            include_runtime=bool(active_stream_id),
+            active_stream_ids={active_stream_id} if active_stream_id else None,
+        )
+    except Exception:
+        payload = {"session_id": str(getattr(session, "session_id", "") or "")}
+    return {"session": payload}
+
+
+def _parse_run_journal_event_id(raw: str | None) -> tuple[str | None, int | None]:
+    return _shared_parse_run_journal_event_id(raw)
 
 
 def _parse_run_journal_after_seq(qs: dict, stream_id: str | None = None) -> int | None:
@@ -16111,6 +16144,122 @@ def _handle_sse_stream(handler, parsed):
             except Exception:
                 pass
     return True
+
+
+def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
+    if not _session_id_visible_to_request_profile(handler, session_id):
+        return True
+    try:
+        session = get_session(session_id, metadata_only=True)
+    except KeyError:
+        return j(handler, {"error": "Session not found"}, status=404)
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("X-Accel-Buffering", "no")
+    # #3103: see _handle_gateway_sse_stream — `Connection: close` causes
+    # EventSource reconnect storms in browsers on long-lived SSE.
+    end_sse_headers(handler)
+
+    resume_event_id = _session_events_resume_event_id(handler, parsed)
+    active_stream_id = _active_run_stream_for_session(session_id)
+    stream = STREAMS.get(active_stream_id) if active_stream_id else None
+    subscriber = None
+    stream_snapshot = {}
+    replay_cutoff_seq = None
+    if stream is not None:
+        if hasattr(stream, "subscribe_with_snapshot"):
+            subscriber, stream_snapshot = stream.subscribe_with_snapshot()
+        else:
+            subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
+            stream_snapshot = {}
+    try:
+        if resume_event_id:
+            replay = read_session_run_events(session_id, after_event_id=resume_event_id)
+            if replay.get("status") != "ok":
+                _sse(handler, "session_snapshot", _session_snapshot_payload(session, active_stream_id=active_stream_id))
+            else:
+                replay_cutoff_seq = _run_journal_same_run_seq(
+                    str(stream_snapshot.get("last_event_id") or ""),
+                    active_stream_id,
+                )
+                for entry in replay.get("events") or []:
+                    event_run_id = str(entry.get("run_id") or "")
+                    event_seq = entry.get("seq")
+                    if (
+                        subscriber is not None
+                        and replay_cutoff_seq is not None
+                        and event_run_id == active_stream_id
+                        and event_seq is not None
+                        and int(event_seq) > int(replay_cutoff_seq)
+                    ):
+                        continue
+                    _sse_with_id(
+                        handler,
+                        entry.get("event") or entry.get("type") or "message",
+                        entry.get("payload"),
+                        entry.get("event_id"),
+                    )
+        if subscriber is None:
+            while True:
+                active_stream_id = _active_run_stream_for_session(session_id)
+                if not active_stream_id:
+                    handler.wfile.write(b": keepalive\n\n")
+                    handler.wfile.flush()
+                    time.sleep(_SSE_HEARTBEAT_INTERVAL_SECONDS)
+                    continue
+                stream = STREAMS.get(active_stream_id)
+                if stream is None:
+                    handler.wfile.write(b": keepalive\n\n")
+                    handler.wfile.flush()
+                    time.sleep(_SSE_HEARTBEAT_INTERVAL_SECONDS)
+                    continue
+                if hasattr(stream, "subscribe_with_snapshot"):
+                    subscriber, stream_snapshot = stream.subscribe_with_snapshot()
+                else:
+                    subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
+                    stream_snapshot = {}
+                break
+        if subscriber is None:
+            return True
+        try:
+            while True:
+                try:
+                    item = subscriber.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
+                except queue.Empty:
+                    handler.wfile.write(b": keepalive\n\n")
+                    handler.wfile.flush()
+                    continue
+                if len(item) >= 3:
+                    event, data, queued_event_id = item[0], item[1], item[2]
+                else:
+                    event, data = item
+                    queued_event_id = STREAM_LAST_EVENT_ID.get(active_stream_id)
+                event_id = queued_event_id or STREAM_LAST_EVENT_ID.get(active_stream_id)
+                event_seq = _run_journal_same_run_seq(event_id, active_stream_id)
+                if replay_cutoff_seq is not None and event_seq is not None and event_seq <= replay_cutoff_seq:
+                    continue
+                if event_id:
+                    _sse_with_id(handler, event, data, event_id)
+                else:
+                    _sse(handler, event, data)
+                if event in ("stream_end", "error", "cancel"):
+                    break
+        except _CLIENT_DISCONNECT_ERRORS:
+            pass
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass
+    finally:
+        if subscriber is not None and subscriber is not stream and hasattr(stream, "unsubscribe"):
+            try:
+                stream.unsubscribe(subscriber)
+            except Exception:
+                pass
+    return True
+
+
+_handle_session_sse_stream_for_session = _handle_session_run_journal_stream_for_session
 
 
 def _terminal_session_lookup(body_or_query):

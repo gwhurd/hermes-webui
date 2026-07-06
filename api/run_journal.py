@@ -75,6 +75,21 @@ def _read_jsonl(path: Path) -> tuple[list[dict], list[dict]]:
     return events, malformed
 
 
+def _parse_run_journal_event_id(raw: str | None) -> tuple[str | None, int | None]:
+    raw = str(raw or "").strip()
+    if not raw:
+        return None, None
+    if ":" in raw:
+        run_id, tail = raw.rsplit(":", 1)
+    else:
+        run_id, tail = None, raw
+    try:
+        seq = max(0, int(tail))
+    except (TypeError, ValueError):
+        return run_id or None, None
+    return run_id or None, seq
+
+
 def _next_seq(path: Path) -> int:
     events, _malformed = _read_jsonl(path)
     seqs = [int(event.get("seq") or 0) for event in events if isinstance(event.get("seq"), int)]
@@ -126,6 +141,56 @@ def _fsync_parent_dir(path: Path) -> None:
             os.close(dir_fd)
     except OSError:
         pass
+
+
+def _event_created_at(event: dict, *, fallback: float = 0.0) -> float:
+    try:
+        return float(event.get("created_at") or fallback)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _session_run_journal_entries(session_id: str, *, session_dir: Path | None = None) -> list[dict]:
+    sid = _validate_id(session_id, "session_id")
+    root = Path(session_dir) if session_dir is not None else _default_session_dir()
+    session_root = root / RUN_JOURNAL_DIR_NAME / sid
+    if not session_root.exists():
+        return []
+    entries: list[dict] = []
+    for path in sorted(session_root.glob("*.jsonl")):
+        run_id = path.stem
+        try:
+            run_id = _validate_id(run_id, "run_id")
+        except ValueError:
+            continue
+        events, malformed = _read_jsonl(path)
+        ordered_events = sorted(
+            [event for event in events if isinstance(event, dict)],
+            key=lambda event: (
+                int(event.get("seq") or 0),
+                _event_created_at(event),
+                str(event.get("event_id") or ""),
+            ),
+        )
+        summary = _summary_from_events(sid, run_id, ordered_events)
+        created_at = min((
+            _event_created_at(event)
+            for event in ordered_events
+        ), default=path.stat().st_mtime if path.exists() else 0.0)
+        entries.append(
+            {
+                "session_id": sid,
+                "run_id": run_id,
+                "path": str(path),
+                "created_at": created_at,
+                "event_count": len(ordered_events),
+                "events": ordered_events,
+                "summary": summary,
+                "malformed": malformed,
+            }
+        )
+    entries.sort(key=lambda entry: (entry["created_at"], entry["run_id"]))
+    return entries
 
 
 def append_run_event(
@@ -260,6 +325,81 @@ def find_run_summary(run_id: str, *, session_dir: Path | None = None) -> dict | 
         summary["path"] = str(path)
         return summary
     return None
+
+
+def read_session_run_events(
+    session_id: str,
+    *,
+    after_event_id: str | None = None,
+    session_dir: Path | None = None,
+) -> dict:
+    """Replay durable run-journal rows for one session after an opaque cursor."""
+    sid = _validate_id(session_id, "session_id")
+    cursor_run_id, cursor_seq = _parse_run_journal_event_id(after_event_id)
+    raw_cursor = str(after_event_id or "").strip()
+    if raw_cursor and cursor_run_id is not None:
+        try:
+            cursor_run_id = _validate_id(cursor_run_id, "run_id")
+        except ValueError:
+            cursor_seq = None
+    if raw_cursor:
+        try:
+            if int(raw_cursor.rsplit(":", 1)[-1]) < 0:
+                cursor_seq = None
+        except (TypeError, ValueError):
+            pass
+    if raw_cursor and (cursor_run_id is None or cursor_seq is None):
+        return {
+            "session_id": sid,
+            "cursor_run_id": cursor_run_id,
+            "cursor_seq": cursor_seq,
+            "status": "cursor_invalid",
+            "events": [],
+        }
+    runs = _session_run_journal_entries(sid, session_dir=session_dir)
+    if not raw_cursor:
+        return {
+            "session_id": sid,
+            "cursor_run_id": None,
+            "cursor_seq": None,
+            "status": "ok",
+            "events": [],
+            "runs": runs,
+        }
+    run_lookup = {entry["run_id"]: entry for entry in runs}
+    cursor_entry = run_lookup.get(cursor_run_id or "")
+    if cursor_entry is None:
+        summary = find_run_summary(cursor_run_id or "", session_dir=session_dir) if cursor_run_id else None
+        status = "cursor_run_missing"
+        summary_sid = str(summary.get("session_id") or "").strip() if summary else ""
+        if summary_sid and summary_sid != sid:
+            status = "cursor_session_mismatch"
+        return {
+            "session_id": sid,
+            "cursor_run_id": cursor_run_id,
+            "cursor_seq": cursor_seq,
+            "status": status,
+            "events": [],
+        }
+    replay_events: list[dict] = []
+    started = False
+    for entry in runs:
+        if not started:
+            if entry["run_id"] != cursor_entry["run_id"]:
+                continue
+            started = True
+        events = entry["events"]
+        if entry["run_id"] == cursor_entry["run_id"] and cursor_seq is not None:
+            events = [event for event in events if int(event.get("seq") or 0) > int(cursor_seq)]
+        replay_events.extend(events)
+    return {
+        "session_id": sid,
+        "cursor_run_id": cursor_run_id,
+        "cursor_seq": cursor_seq,
+        "status": "ok",
+        "events": replay_events,
+        "runs": runs,
+    }
 
 
 def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> bool:

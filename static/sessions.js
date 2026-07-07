@@ -1538,15 +1538,14 @@ async function loadSession(sid){
     return loadSession(continuationSid,{...opts,skipLineageResolve:true,skipContinuationResolve:true,force:true});
   }
   S.session=data.session;
-  // #5567: repair a session whose stored model_provider was contaminated with a
-  // foreign provider (frontend tab/profile-switch race). Runs before the model
-  // dropdown / send path reads S.session.model_provider, so a poisoned session
-  // stops re-sending the wrong provider from its very next turn.
-  if(typeof _repairContaminatedSessionModelProvider==='function') _repairContaminatedSessionModelProvider(S.session);
   if(typeof _clearEmptyComposerModelOverride==='function') _clearEmptyComposerModelOverride();
   // Loading a real existing session abandons any pre-session toolset override
   // staged on the empty composer before any deferred refresh work runs.
   S._pendingSessionToolsets=null;
+  // #5567: drop a contaminated stored model_provider before the first reader
+  // (populateModelDropdown / the send path). Full rationale on
+  // _repairContaminatedSessionModelProvider in ui.js.
+  if(typeof _repairContaminatedSessionModelProvider==='function') _repairContaminatedSessionModelProvider(S.session);
   if(typeof populateModelDropdown==='function'){
     const modelRefreshSid=sid;
     const isActiveModelRefreshSession=()=>!!(S.session&&S.session.session_id===modelRefreshSid);

@@ -4025,6 +4025,10 @@ def _sanitize_messages_for_api(
                 # Orphaned tool result — skip to avoid 400 from strict providers.
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        # Drop empty tool_calls — strict providers (DeepSeek, newer OpenAI)
+        # reject tool_calls: [] with HTTP 400 even when no orphaned calls exist.
+        if 'tool_calls' in sanitized and not sanitized['tool_calls']:
+            del sanitized['tool_calls']
         # Provider-aware reasoning_content stripping from model-facing history.
         # Historical assistant reasoning_content is stripped only when the user
         # explicitly requests strip mode or auto mode identifies a local/generic
@@ -4136,6 +4140,8 @@ def _api_safe_message_positions(messages):
             if not tid or tid not in valid_tool_call_ids:
                 continue
         sanitized = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS}
+        if 'tool_calls' in sanitized and not sanitized['tool_calls']:
+            del sanitized['tool_calls']
         if is_recovered:
             sanitized['_recovered'] = True  # temporary marker — stripped before return
         if 'content' in sanitized:
@@ -4315,6 +4321,12 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
         if not isinstance(msg, dict):
             return None
         projected = {k: v for k, v in msg.items() if k in _API_SAFE_MSG_KEYS and msg.get('role')}
+        # Mirror the empty-tool_calls drop applied by _api_safe_message_positions
+        # (#5737) so this projection matches the API-safe positions it's aligned
+        # against — otherwise a row stored with tool_calls: [] projects
+        # differently here than in prev_safe and loses its metadata carry-forward.
+        if 'tool_calls' in projected and not projected['tool_calls']:
+            del projected['tool_calls']
         if 'content' in projected:
             projected['content'] = _strip_oob_blocks(projected['content'])
         return projected

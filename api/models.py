@@ -1571,8 +1571,12 @@ def _process_wakeup_pause_provider_part(value) -> str:
 def _process_wakeup_pause_lane(model=None, provider=None) -> tuple[str, str]:
     model_part = _process_wakeup_pause_part(model)
     provider_part = _process_wakeup_pause_provider_part(provider)
-    if model_part.startswith('@') and ':' in model_part:
-        provider_hint, bare_model = model_part[1:].rsplit(':', 1)
+    try:
+        parsed_route_hint = _cfg._parse_provider_qualified_model_id(model)
+    except Exception:
+        parsed_route_hint = None
+    if parsed_route_hint is not None:
+        bare_model, provider_hint = parsed_route_hint
         provider_hint = _process_wakeup_pause_provider_part(provider_hint)
         bare_model = _process_wakeup_pause_part(bare_model)
         if provider_hint and not provider_part:

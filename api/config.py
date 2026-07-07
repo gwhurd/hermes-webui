@@ -2430,6 +2430,31 @@ def _custom_slug_rest_looks_like_host_port(rest: str) -> bool:
     return False
 
 
+def _parse_provider_qualified_model_id(model_id: str) -> tuple[str, str] | None:
+    """Parse WebUI's ``@provider:model`` route hint into ``(model, provider)``.
+
+    The provider segment can contain colons for named custom providers, while
+    the model segment can also contain colons for tags such as ``:free``.
+    Keep this parser shared with ``resolve_model_provider`` so any caller that
+    compares route-hinted model lanes uses the same grammar.
+    """
+    candidate = str(model_id or "").strip()
+    if not candidate.startswith("@") or ":" not in candidate:
+        return None
+    inner = candidate[1:]
+    provider_hint, bare_model = inner.rsplit(":", 1)
+    if provider_hint.startswith("custom:") and provider_hint.count(":") >= 2:
+        _slug_rest = provider_hint[len("custom:"):]
+        if not _custom_slug_rest_looks_like_host_port(_slug_rest):
+            provider_hint, extra = provider_hint.rsplit(":", 1)
+            bare_model = f"{extra}:{bare_model}"
+    elif (provider_hint not in _PROVIDER_MODELS
+            and provider_hint not in _PROVIDER_DISPLAY
+            and not provider_hint.startswith("custom:")):
+        provider_hint, bare_model = inner.split(":", 1)
+    return bare_model, provider_hint
+
+
 def _get_provider_base_url(provider_id):
     """Look up the configured base_url for a provider (e.g. lmstudio).
 
@@ -2667,18 +2692,9 @@ def resolve_model_provider(model_id: str) -> tuple:
     #
     # Exception: ``custom:<ip-or-host>:<port>`` is a single logical slug derived
     # from OpenAI ``base_url`` authority and contains no eaten model segments.
-    if model_id.startswith("@") and ":" in model_id:
-        inner = model_id[1:]
-        provider_hint, bare_model = inner.rsplit(":", 1)
-        if provider_hint.startswith("custom:") and provider_hint.count(":") >= 2:
-            _slug_rest = provider_hint[len("custom:"):]
-            if not _custom_slug_rest_looks_like_host_port(_slug_rest):
-                provider_hint, extra = provider_hint.rsplit(":", 1)
-                bare_model = f"{extra}:{bare_model}"
-        elif (provider_hint not in _PROVIDER_MODELS
-                and provider_hint not in _PROVIDER_DISPLAY
-                and not provider_hint.startswith("custom:")):
-            provider_hint, bare_model = inner.split(":", 1)
+    parsed_provider_hint = _parse_provider_qualified_model_id(model_id)
+    if parsed_provider_hint is not None:
+        bare_model, provider_hint = parsed_provider_hint
         if (
             provider_hint.startswith("custom:")
             and config_base_url

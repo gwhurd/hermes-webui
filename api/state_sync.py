@@ -134,7 +134,9 @@ def sync_session_start(session_id: str, model=None, profile: Optional[str] = Non
 
 def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=0,
                        estimated_cost=None, model=None, title: Optional[str] = None,
-                       message_count: Optional[int] = None, profile: Optional[str] = None) -> None:
+                       message_count: Optional[int] = None, profile: Optional[str] = None,
+                       cache_read_tokens: int = 0, cache_write_tokens: int = 0,
+                       api_call_count: Optional[int] = None) -> None:
     """Update token usage and title for a WebUI session in state.db.
     Called after each turn completes. Uses absolute=True to set totals
     (the WebUI Session already accumulates across turns).
@@ -153,11 +155,48 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
     try:
         # Ensure session exists first (idempotent)
         db.ensure_session(session_id=session_id, source='webui', model=model)
-        # Set absolute token counts
+        # Preserve the existing api_call_count when the caller doesn't supply one.
+        # update_token_counts(absolute=True) assigns `api_call_count = ?` DIRECTLY
+        # (no COALESCE, unlike the other fields), so passing None/0 here would wipe
+        # the accumulated count. Several callers (title-only / chat-sync syncs) have
+        # no api-call figure, so read the current DB value and pass it back through
+        # to make the absolute write a no-op for this field. (#5463 gate fix.)
+        if api_call_count is None:
+            try:
+                _existing = db.get_session(session_id) or {}
+                api_call_count = _existing.get('api_call_count') or 0
+            except Exception:
+                api_call_count = 0
+                logger.debug("Failed to read existing api_call_count; defaulting to 0", exc_info=True)
+        else:
+            # Monotonic floor: api_call_count is written absolute, but the value
+            # comes from the in-memory agent's session_api_calls, which RESETS to
+            # 0 on a rebuilt agent (server restart / SESSIONS-LRU evict / cached-
+            # agent rebuild) and then counts up from 1. Writing that directly would
+            # regress the durable total (e.g. 7 -> 1 after the first post-rebuild
+            # turn). Never let an absolute write lower the stored count — take the
+            # max of incoming vs existing. (#5463 gate fix; full cumulative
+            # accuracy across rebuilds needs agent-side counter seeding, tracked
+            # as a follow-up.)
+            try:
+                _existing = db.get_session(session_id) or {}
+                _prior = _existing.get('api_call_count') or 0
+                if _prior > api_call_count:
+                    api_call_count = _prior
+            except Exception:
+                logger.debug("Failed to read existing api_call_count for monotonic floor", exc_info=True)
+        # Set absolute token counts. WebUI's sidecar already accumulates
+        # input/output/cache totals across turns, so mirror the same absolute
+        # values into state.db. Omitting cache counters makes insights/reporting
+        # show false 0% hit rates even when the live stream and sidecar saw warm
+        # prefix reads.
         db.update_token_counts(
             session_id=session_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            api_call_count=api_call_count,
             estimated_cost_usd=estimated_cost,
             model=model,
             absolute=True,

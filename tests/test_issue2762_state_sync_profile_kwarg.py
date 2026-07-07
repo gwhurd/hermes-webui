@@ -82,12 +82,14 @@ def _read_session(db_path: Path, session_id: str):
     if not db_path.exists():
         return None
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     try:
         # Real state.db schema (see api/state_sync.py + hermes_cli StateDB):
         # `sessions` table has `id` as PRIMARY KEY (not session_id). Use real
         # column names so the test queries the actual schema.
         cur = conn.execute(
-            "SELECT id AS session_id, title, input_tokens, output_tokens "
+            "SELECT id AS session_id, title, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_write_tokens, api_call_count "
             "FROM sessions WHERE id = ?",
             (session_id,),
         )
@@ -213,6 +215,9 @@ def test_sync_session_usage_writes_only_to_named_profile(two_profile_homes):
         title='2762 regression test',
         message_count=3,
         profile='maiko',
+        cache_read_tokens=1200,
+        cache_write_tokens=300,
+        api_call_count=7,
     )
 
     maiko_row = _read_session(two_profile_homes['maiko'] / 'state.db', '2762-regression')
@@ -220,6 +225,9 @@ def test_sync_session_usage_writes_only_to_named_profile(two_profile_homes):
 
     assert maiko_row is not None, \
         "sync_session_usage(profile='maiko') did not write to maiko's state.db"
+    assert maiko_row["cache_read_tokens"] == 1200
+    assert maiko_row["cache_write_tokens"] == 300
+    assert maiko_row["api_call_count"] == 7
     assert hiyuki_row is None, \
         "sync_session_usage(profile='maiko') leaked into hiyuki's state.db — #2762 regression"
 
@@ -448,3 +456,143 @@ def test_invalid_profile_name_refused_not_falls_back(two_profile_homes, bad_name
     assert maiko_row is None, (
         f"invalid profile name {bad_name!r} somehow ended up in maiko's state.db"
     )
+
+
+def test_sync_session_usage_none_api_call_count_preserves_existing(two_profile_homes, monkeypatch):
+    """#5463 gate fix: a sync that carries no api_call_count (title-only /
+    chat-sync callers pass None) must NOT wipe an already-accumulated count.
+
+    update_token_counts(absolute=True) assigns `api_call_count = ?` directly
+    (no COALESCE), so before the fix a None/0 sync clobbered it to NULL/0.
+    sync_session_usage now reads the existing value and passes it back through
+    when the caller supplies None.
+    """
+    pytest.importorskip("hermes_state")
+    import importlib
+    import api.state_sync as state_sync
+    importlib.reload(state_sync)
+
+    sid = "apicount-preserve-probe"
+    db_path = two_profile_homes['maiko'] / 'state.db'
+
+    # Seed a session with an accumulated api_call_count via the real DB API.
+    from hermes_state import SessionDB
+    db = SessionDB(db_path)
+    try:
+        db.ensure_session(session_id=sid, source='webui', model='probe')
+        db.update_token_counts(session_id=sid, input_tokens=10, output_tokens=20,
+                               api_call_count=7, absolute=True)
+    finally:
+        db.close()
+    assert _read_session(db_path, sid)['api_call_count'] == 7
+
+    # A later usage sync with NO api_call_count (None) must leave it at 7.
+    state_sync.sync_session_usage(
+        session_id=sid,
+        input_tokens=30,
+        output_tokens=40,
+        model='probe',
+        title='probe',
+        message_count=2,
+        profile='maiko',
+        api_call_count=None,
+    )
+    row = _read_session(db_path, sid)
+    assert row['api_call_count'] == 7, (
+        "None api_call_count clobbered the accumulated count (#5463 NULL-clobber regression)"
+    )
+    # Token totals still updated (absolute).
+    assert row['input_tokens'] == 30 and row['output_tokens'] == 40
+
+    # A real api_call_count still updates the value.
+    state_sync.sync_session_usage(
+        session_id=sid,
+        input_tokens=50,
+        output_tokens=60,
+        model='probe',
+        message_count=3,
+        profile='maiko',
+        api_call_count=12,
+    )
+    assert _read_session(db_path, sid)['api_call_count'] == 12
+
+
+def test_sync_session_usage_zero_api_call_count_preserves_existing(two_profile_homes, monkeypatch):
+    """#5463 gate fix (Codex/Fable): a rebuilt in-memory agent reports
+    session_api_calls == 0 (fresh counter), and the streaming call site maps a
+    falsy value to None so the preserve-guard keeps the durable count. This pins
+    that a literal 0 reaching sync_session_usage via the None path (mapped at the
+    call site) does NOT regress an accumulated count — modeling the call site's
+    `getattr(agent, 'session_api_calls', None) or None`.
+    """
+    pytest.importorskip("hermes_state")
+    import importlib
+    import api.state_sync as state_sync
+    importlib.reload(state_sync)
+
+    sid = "apicount-zero-preserve-probe"
+    db_path = two_profile_homes['maiko'] / 'state.db'
+    from hermes_state import SessionDB
+    db = SessionDB(db_path)
+    try:
+        db.ensure_session(session_id=sid, source='webui', model='probe')
+        db.update_token_counts(session_id=sid, input_tokens=1, output_tokens=1,
+                               api_call_count=9, absolute=True)
+    finally:
+        db.close()
+    assert _read_session(db_path, sid)['api_call_count'] == 9
+
+    # The streaming call site maps `0 or None` -> None; assert that path preserves.
+    rebuilt_agent_calls = 0
+    state_sync.sync_session_usage(
+        session_id=sid,
+        input_tokens=5,
+        output_tokens=5,
+        model='probe',
+        message_count=1,
+        profile='maiko',
+        api_call_count=(rebuilt_agent_calls or None),
+    )
+    assert _read_session(db_path, sid)['api_call_count'] == 9, (
+        "a rebuilt agent's 0 session_api_calls regressed the durable count (#5463)"
+    )
+
+
+def test_sync_session_usage_positive_lower_api_call_count_does_not_regress(two_profile_homes, monkeypatch):
+    """#5463 gate fix (Codex r2): after a rebuilt agent completes one real API
+    call, session_api_calls == 1 (positive, non-None), which written absolute
+    would overwrite a durable count of 7. The monotonic floor keeps the higher
+    stored value so the count never goes backward."""
+    pytest.importorskip("hermes_state")
+    import importlib
+    import api.state_sync as state_sync
+    importlib.reload(state_sync)
+
+    sid = "apicount-monotonic-probe"
+    db_path = two_profile_homes['maiko'] / 'state.db'
+    from hermes_state import SessionDB
+    db = SessionDB(db_path)
+    try:
+        db.ensure_session(session_id=sid, source='webui', model='probe')
+        db.update_token_counts(session_id=sid, input_tokens=1, output_tokens=1,
+                               api_call_count=7, absolute=True)
+    finally:
+        db.close()
+    assert _read_session(db_path, sid)['api_call_count'] == 7
+
+    # Rebuilt agent's first post-rebuild turn reports a positive-but-lower count.
+    state_sync.sync_session_usage(
+        session_id=sid, input_tokens=3, output_tokens=3, model='probe',
+        message_count=1, profile='maiko', api_call_count=1,
+    )
+    assert _read_session(db_path, sid)['api_call_count'] == 7, (
+        "positive-lower rebuilt count regressed the durable total (#5463 monotonic floor)"
+    )
+
+    # A genuinely-higher count still advances the total.
+    state_sync.sync_session_usage(
+        session_id=sid, input_tokens=5, output_tokens=5, model='probe',
+        message_count=2, profile='maiko', api_call_count=12,
+    )
+    assert _read_session(db_path, sid)['api_call_count'] == 12
+

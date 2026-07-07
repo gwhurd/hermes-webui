@@ -173,23 +173,39 @@ def test_realign_allows_on_desktop_no_native_anchor():
 # ---- fallback guard (_restoreMessageScrollSnapshotSameFrame) ---------------------
 
 def _fallback_harness(*, snapshot_scroll_height, cur_scroll_height, snapshot_top,
-                      active_intent: bool = False, touch_like: bool = True) -> str:
+                      active_intent: bool = False, touch_like: bool = True,
+                      anchor=None, anchor_row_top=None, container_top=0,
+                      init_scroll_top=90030) -> str:
+    """anchor: dict for snapshot.anchor (e.g. {"key":"k1","topOffset":1000,...}) or None.
+    anchor_row_top: the anchor row's CURRENT getBoundingClientRect().top (absolute), used
+    with container_top to compute currentTopOffset = anchor_row_top - container_top. When
+    anchor is set and anchor_row_top is given, the mock container resolves the row; when
+    anchor_row_top is None the row lookup returns nothing (row gone -> raw fallback)."""
     js = UI_JS_PATH.read_text(encoding="utf-8")
     intent_js = "true" if active_intent else "false"
     touch_js = "true" if touch_like else "false"
     sh = "null" if snapshot_scroll_height is None else str(snapshot_scroll_height)
+    anchor_js = "null" if anchor is None else json.dumps(anchor)
+    row_present = anchor is not None and anchor_row_top is not None
+    row_top_js = "0" if anchor_row_top is None else str(anchor_row_top)
     return _extract_func_script(js) + f"""
 let writes = [];
-let stTop = 90030;
+let stTop = {init_scroll_top};
+const _anchorRow = {"{" if row_present else "null"}{
+  f' getBoundingClientRect(){{ return {{ top: {row_top_js} }}; }}, getClientRects(){{ return [{{}}]; }} }}' if row_present else ''
+};
 const el = {{
   get scrollTop(){{ return stTop; }}, set scrollTop(v){{ writes.push(Math.round(v)); stTop = v; }},
   scrollHeight: {cur_scroll_height}, clientHeight: 427,
+  getBoundingClientRect(){{ return {{ top: {container_top}, bottom: {container_top} + 427 }}; }},
+  querySelector(sel){{ return _anchorRow; }},
+  querySelectorAll(sel){{ return _anchorRow ? [_anchorRow] : []; }},
 }};
 function $(id){{ return id === 'messages' ? el : null; }}
 function _recentMessageScrollIntent(){{ return {intent_js}; }}
 function _recentMessageTouchScrollIntent(){{ return {intent_js}; }}
 function _isTouchLikeMessageViewport(){{ return {touch_js}; }}
-// realign path fails (no anchor) so execution reaches the absolute fallback
+// realign path fails (no anchor restore) so execution reaches the absolute fallback
 function _restorePinnedMessageScrollSnapshot(){{ return false; }}
 function _restoreMessageViewportAnchor(){{ return false; }}
 function _remountMessageViewportAnchor(){{ return false; }}
@@ -200,8 +216,9 @@ const performance = {{ now(){{ return 1; }} }};
 function _deferClearProgrammaticScroll(){{}}
 function requestAnimationFrame(cb){{ cb(); }}
 function setTimeout(cb){{ cb(); return 1; }}
-const snapshot = {{ anchor: null, top: {snapshot_top}, bottom: 40,
+const snapshot = {{ anchor: {anchor_js}, top: {snapshot_top}, bottom: 40,
   scrollHeight: {sh}, pinned: false, userUnpinned: false }};
+eval(extractFunc('_aboveViewportGrowthFromAnchor'));
 eval(extractFunc('_restoreMessageScrollSnapshotSameFrame'));
 _restoreMessageScrollSnapshotSameFrame(snapshot);
 console.log(JSON.stringify({{ wrote: writes.length, writes,
@@ -253,20 +270,123 @@ def test_fallback_allows_snapshot_top_with_active_intent():
     assert m["writes"] == [89577]
 
 
-def test_fallback_allows_snapshot_top_on_desktop_no_native_anchor():
-    """Desktop regression (#5637 gate cert): the exact stale-snapshot case (content grew,
-    reader not pinned, no intent, absolute write would move >8px) but on a
-    hover+fine-pointer viewport where `.messages` is `overflow-anchor:none`. With no
-    native anchoring layer to hold the reader, the fallback MUST keep its absolute
-    snapshot.top restore rather than refuse and latch userUnpinned — otherwise the
-    desktop reader is left at the wrong absolute position and force-unpinned.
-    Mutation: drop the `_fbTouchHold&&` term from the fallback guard and this FAILS
-    (the write is wrongly refused and userUnpinned is latched on desktop)."""
+def test_fallback_compensates_only_above_viewport_growth_on_desktop():
+    """Desktop above-viewport-growth compensation (issue #5637 follow-up, supersedes the
+    round-1 total-growth desktop assertion that greptile + the maintainer flagged).
+
+    Desktop (`.messages` overflow-anchor:none) must keep an ABSOLUTE restore (refusing
+    would leave the reader unheld + latch userUnpinned). But the raw snapshot.top is stale
+    when content grew ABOVE the viewport: it maps to a position shifted down by that growth,
+    so restoring it yanks the still reader up. The fix compensates by the above-viewport
+    growth measured from the anchor row (currentTopOffset - anchor.topOffset), NOT total
+    scrollHeight growth.
+
+    Here all growth is above the viewport: the anchor row was at topOffset 1000 at capture
+    and is now at 1500 (container top 0), so it shifted +500 — exactly the above-viewport
+    growth. Reader parked at scrollTop 1000 -> compensated to 1500, held on the same content.
+
+    Mutation: revert `_fbTarget` to the raw `target` and this FAILS (writes 1000, the stale
+    up-jump). Desktop hold semantics (userUnpinned false, scrollPinned true) unchanged.
+    """
+    # Above-viewport growth: the reader's LIVE scrollTop has already been carried down toward
+    # the compensated value by that above-viewport growth (ground truth ~1480), so the
+    # direction-aware pick chooses compensated (1500), not raw (1000).
     m = json.loads(_run_node(_fallback_harness(
-        snapshot_scroll_height=90000, cur_scroll_height=90453, snapshot_top=89577,
+        snapshot_scroll_height=90000, cur_scroll_height=90500, snapshot_top=1000,
         active_intent=False, touch_like=False,
+        anchor={"key": "k1", "sessionIdx": 5, "rawIdx": 5, "topOffset": 1000},
+        anchor_row_top=1500, container_top=0, init_scroll_top=1480,
     )))
-    assert m["writes"] == [89577]
+    assert m["writes"] == [1500]
+    assert m["messageUserUnpinned"] is False and m["scrollPinned"] is True
+
+
+def test_fallback_does_not_move_reader_for_below_viewport_growth_on_desktop():
+    """THE greptile/maintainer BLOCKING case: content grew but it is BELOW the scrolled-up
+    reader (the live tail / expanding tool cards). Below-viewport growth must NOT move the
+    reader. The anchor row above the viewport did NOT shift (still at its captured topOffset
+    1000 -> currentTopOffset 1000, aboveGrowth 0), and the reader's live scrollTop is
+    unchanged (still 1000), so the direction-aware pick keeps the raw snapshot.top — NOT
+    shoved down by the below-viewport growth.
+
+    scrollHeight grew 90000->95000 (all 5000 below the viewport); the round-1 total-growth
+    fix would have written 1000+5000=6000 (a 5000px downward shove). Direction-aware keeps 1000.
+
+    Mutation: revert to total-growth compensation and this FAILS (writes 6000, the down-drift).
+    """
+    m = json.loads(_run_node(_fallback_harness(
+        snapshot_scroll_height=90000, cur_scroll_height=95000, snapshot_top=1000,
+        active_intent=False, touch_like=False,
+        anchor={"key": "k1", "sessionIdx": 5, "rawIdx": 5, "topOffset": 1000},
+        anchor_row_top=1000, container_top=0, init_scroll_top=1000,
+    )))
+    assert m["writes"] == [1000]
+    assert m["messageUserUnpinned"] is False and m["scrollPinned"] is True
+
+
+def test_fallback_tail_growth_does_not_drift_even_with_stale_anchor_offset():
+    """Direction-aware regression (maintainer BLOCKING): a scrolled-up reader with content
+    growing at the TAIL. Even if the anchor row's measured offset drifts slightly (say the
+    row re-measured +200 for its own content, not above-viewport growth), the reader's live
+    scrollTop stayed at 1000 (below-viewport tail growth doesn't move them). The compensated
+    candidate would be 1200 but the raw 1000 is nearer the live position, so direction-aware
+    keeps 1000 — no conveyor-belt drift toward the tail across refresh ticks.
+
+    Mutation: drop the nearest-to-current-scrollTop pick (always use compensated when
+    aboveDelta>0) and this FAILS (writes 1200, drifting the reader down).
+    """
+    m = json.loads(_run_node(_fallback_harness(
+        snapshot_scroll_height=90000, cur_scroll_height=95000, snapshot_top=1000,
+        active_intent=False, touch_like=False,
+        anchor={"key": "k1", "sessionIdx": 5, "rawIdx": 5, "topOffset": 1000},
+        anchor_row_top=1200, container_top=0, init_scroll_top=1000,
+    )))
+    assert m["writes"] == [1000]
+    assert m["messageUserUnpinned"] is False and m["scrollPinned"] is True
+
+
+def test_fallback_partial_below_growth_compensates_only_above_part():
+    """Mixed growth: some above, some below the reader. The anchor row shifted +300 (the
+    above-viewport growth), and the reader's live scrollTop was carried down to ~1290 by
+    that above growth, while total scrollHeight grew 2000 (the other 1700 is below). The
+    compensated candidate (1300) is nearest the live position, so direction-aware picks it —
+    the reader is held against the above part only, not shoved by the 1700 below-viewport
+    growth (raw 1000 would be a 290px up-jump)."""
+    m = json.loads(_run_node(_fallback_harness(
+        snapshot_scroll_height=90000, cur_scroll_height=92000, snapshot_top=1000,
+        active_intent=False, touch_like=False,
+        anchor={"key": "k1", "sessionIdx": 5, "rawIdx": 5, "topOffset": 1000},
+        anchor_row_top=1300, container_top=0, init_scroll_top=1290,
+    )))
+    assert m["writes"] == [1300]
+    assert m["messageUserUnpinned"] is False and m["scrollPinned"] is True
+
+
+def test_fallback_desktop_falls_back_to_raw_when_anchor_row_gone():
+    """When the anchor row can't be located (recycled/removed after the re-render),
+    _aboveViewportGrowthFromAnchor returns null and the fallback keeps the raw
+    snapshot.top write (prior desktop gate-cert behavior) rather than guessing. Here the
+    anchor is present in the snapshot but the row is absent from the DOM (anchor_row_top
+    None -> querySelector returns nothing)."""
+    m = json.loads(_run_node(_fallback_harness(
+        snapshot_scroll_height=90000, cur_scroll_height=95000, snapshot_top=1000,
+        active_intent=False, touch_like=False,
+        anchor={"key": "k1", "sessionIdx": 5, "rawIdx": 5, "topOffset": 1000},
+        anchor_row_top=None, container_top=0, init_scroll_top=1000,
+    )))
+    assert m["writes"] == [1000]
+    assert m["messageUserUnpinned"] is False and m["scrollPinned"] is True
+
+
+def test_fallback_desktop_no_anchor_falls_back_to_raw():
+    """Legacy/absent snapshot.anchor -> no above-growth measurable -> raw snapshot.top
+    restore (unchanged desktop behavior)."""
+    m = json.loads(_run_node(_fallback_harness(
+        snapshot_scroll_height=90000, cur_scroll_height=95000, snapshot_top=1000,
+        active_intent=False, touch_like=False,
+        anchor=None, init_scroll_top=1000,
+    )))
+    assert m["writes"] == [1000]
     assert m["messageUserUnpinned"] is False and m["scrollPinned"] is True
 
 

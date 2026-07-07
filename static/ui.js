@@ -13511,6 +13511,35 @@ window._fixMobileScrollJank=function _fixMobileScrollJank(){
   });
 };
 
+// Measure the ABOVE-viewport content growth since a snapshot was captured, using the
+// snapshot's anchor row. anchor.topOffset is the row's distance below the container top
+// at capture; its current distance minus that is exactly how far the row (and thus all
+// content above the viewport) shifted down since capture — i.e. the above-viewport growth.
+// Below-viewport growth (the live tail, expanding tool cards) does NOT move a row that sits
+// above the viewport, so it is correctly excluded. Returns the delta (>=0 after clamping to
+// a non-negative shift), or null when the anchor / its row can't be resolved so the caller
+// falls back to the raw absolute restore rather than guessing. Row lookup mirrors
+// _restoreMessageViewportAnchor: anchor key first, then stable session index, then rawIdx.
+function _aboveViewportGrowthFromAnchor(container, anchor){
+  if(!container||!anchor||typeof container.querySelector!=='function') return null;
+  const topOffset=Number(anchor.topOffset);
+  if(!Number.isFinite(topOffset)) return null;
+  const anchorKey=String(anchor.key||'');
+  let row=anchorKey
+    ? Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey)
+    : null;
+  const sessionIdx=Number(anchor.sessionIdx);
+  if(!row&&Number.isFinite(sessionIdx)) row=container.querySelector(`[data-session-msg-idx="${sessionIdx}"]`);
+  const rawIdx=Number(anchor.rawIdx);
+  if(!row&&Number.isFinite(rawIdx)) row=container.querySelector(`[data-msg-idx="${rawIdx}"]`);
+  if(!row||typeof row.getBoundingClientRect!=='function') return null;
+  if(row.getClientRects&&row.getClientRects().length===0) return null;
+  const containerRect=container.getBoundingClientRect();
+  const rect=row.getBoundingClientRect();
+  const currentTopOffset=rect.top-containerRect.top;
+  const delta=currentTopOffset-topOffset;
+  return delta>0?delta:0;
+}
 function _restoreMessageScrollSnapshotSameFrame(snapshot){
   const el=$('messages');
   if(!el||!snapshot) return;
@@ -13578,8 +13607,40 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
       _nearBottomCount=0;
       return;
     }
+    // Desktop stale-snapshot compensation (issue #5637 follow-up). On desktop
+    // (overflow-anchor:none) the touch refusal above does NOT apply — the reader must be
+    // actively held, so we keep writing an absolute scrollTop. But the raw snapshot.top can
+    // be stale: it was captured before this live refresh, and restoring it holds the reader
+    // at the wrong offset if content grew ABOVE the viewport since capture.
+    //
+    // DIRECTION-AWARE compensation (maintainer gate-cert on this PR). Two candidates:
+    //   - raw = snapshot.top (correct when growth is BELOW the scrolled-up reader — the
+    //     common streaming case: live tail, expanding tool cards, re-estimated rows below
+    //     don't shift the reader, so the pre-growth absolute top is still right), and
+    //   - compensated = snapshot.top + above-viewport growth (correct when growth is ABOVE
+    //     the viewport, which shifts the reader's content down).
+    // The current el.scrollTop is ground truth for where the reader actually is right now,
+    // so pick whichever candidate is NEAREST to it: above-viewport growth pulls the reader's
+    // live position toward the compensated value (compensated wins → heal); below-viewport
+    // tail growth / an auto-follow-OFF reader leaves the live position at the raw value (raw
+    // wins → no downward conveyor-belt drift, no force-follow). The above-viewport growth is
+    // measured exactly from the snapshot's anchor row (currentRectTop - anchor.topOffset);
+    // when the anchor row can't be located there is no compensated candidate and raw is kept.
+    let _fbTarget=target;
+    if(!_fbTouchHold && snapshot.pinned!==true && _grewSinceSnap && !_fbActiveIntent
+       && Number.isFinite(_snapSH) && _snapSH>0){
+      const _rawTop=Number(snapshot.top)||0;
+      const _aboveDelta=_aboveViewportGrowthFromAnchor(el, snapshot.anchor);
+      if(_aboveDelta!==null && _aboveDelta>0){
+        const _compensated=_rawTop+_aboveDelta;
+        const _cur=el.scrollTop;
+        // nearest-to-ground-truth: compensated only when it is closer to the live position.
+        _fbTarget=(Math.abs(_compensated-_cur)<=Math.abs(_rawTop-_cur))?_compensated:_rawTop;
+      }
+      // else: anchor row gone / no above-growth measurable -> keep raw snapshot.top.
+    }
     _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-    el.scrollTop=Math.max(0,Math.min(target,maxTop));
+    el.scrollTop=Math.max(0,Math.min(_fbTarget,maxTop));
   }
   _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
   if(snapshot.pinned===true){

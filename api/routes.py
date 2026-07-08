@@ -470,6 +470,7 @@ from api.profiles import (  # noqa: F401, E402  (re-export)
     get_active_profile_name as _get_active_profile_name,
     get_active_hermes_home,
     list_profiles_api,
+    profile_scope_for_detached_worker,
 )
 
 
@@ -2810,6 +2811,7 @@ from api.config import (
     save_settings,
     SETTINGS_FILE,
     set_hermes_default_model,
+    canonical_model_provider_lane,
     model_with_provider_context,
     get_reasoning_status,
     set_reasoning_display,
@@ -8674,6 +8676,13 @@ from api.models import (
     _profile_has_user_projects,
     is_cron_session,
     is_safe_session_id,
+    PROCESS_WAKEUP_PAUSE_ERROR,
+    clear_process_wakeup_pause,
+    clear_process_wakeup_pause_if_model_changed,
+    process_wakeup_pause_matches,
+    process_wakeup_credential_state_fingerprint,
+    process_wakeup_pause_credential_state_changed,
+    suppress_process_wakeup_for_provider_pause,
 )
 
 
@@ -8906,7 +8915,14 @@ from api.run_journal import (
     stale_interrupted_event,
 )
 from api.todo_state import attach_todo_state
-from api.providers import get_providers, get_provider_quota, get_provider_cost_history, set_provider_key, remove_provider_key
+from api.providers import (
+    get_providers,
+    get_provider_quota,
+    get_provider_cost_history,
+    provider_has_usable_credential,
+    set_provider_key,
+    remove_provider_key,
+)
 from api.onboarding import (
     apply_onboarding_setup,
     get_onboarding_status,
@@ -19828,6 +19844,57 @@ def _start_run(
     )
 
 
+def _process_wakeup_revalidation_provider(model, provider) -> str:
+    """Return the canonical provider id used for wakeup credential revalidation."""
+    try:
+        _resolved_model, resolved_provider = canonical_model_provider_lane(model, provider)
+    except Exception:
+        logger.debug(
+            "failed to canonicalize process_wakeup revalidation lane for model=%r provider=%r",
+            model,
+            provider,
+            exc_info=True,
+        )
+        resolved_provider = None
+    candidate = resolved_provider if resolved_provider else provider
+    return str(candidate or "").strip()
+
+
+def _process_wakeup_provider_has_usable_credential(
+    session,
+    *,
+    model,
+    provider,
+    provider_id: str | None = None,
+) -> bool:
+    """Check paused-lane credential recovery in the owning session profile."""
+    provider_id = str(
+        provider_id or _process_wakeup_revalidation_provider(model, provider) or ""
+    ).strip()
+    if not provider_id:
+        return False
+    profile_name = str(getattr(session, "profile", "") or "").strip()
+    if profile_name and not _is_root_profile(profile_name):
+        with profile_scope_for_detached_worker(
+            profile_name,
+            "process_wakeup credential revalidation",
+            logger_override=logger,
+        ):
+            return provider_has_usable_credential(provider_id, refresh=True)
+    return provider_has_usable_credential(provider_id, refresh=True)
+
+
+def _refresh_process_wakeup_pause_credential_fingerprint(session) -> bool:
+    """Refresh the stored credential fingerprint without clearing the pause."""
+    pause = getattr(session, "process_wakeup_pause", None)
+    if not isinstance(pause, dict) or not pause.get("paused"):
+        return False
+    updated = dict(pause)
+    updated["credential_state_fingerprint"] = process_wakeup_credential_state_fingerprint(session)
+    session.process_wakeup_pause = updated
+    return True
+
+
 def start_session_turn(
     session_id: str,
     message: str,
@@ -19867,6 +19934,7 @@ def start_session_turn(
     msg = str(message or "").strip()
     if not msg:
         return {"error": "message is required", "_status": 400}
+    turn_source = str(source or "process_wakeup").strip() or "process_wakeup"
     try:
         s = get_session(session_id)
     except KeyError:
@@ -19895,6 +19963,115 @@ def start_session_turn(
         profile_config=_pp_cfg,
         prefer_cached_catalog=True,
     )
+    if clear_process_wakeup_pause_if_model_changed(
+        s,
+        model=model,
+        provider=model_provider,
+    ):
+        try:
+            s.save(touch_updated_at=False)
+        except Exception:
+            logger.debug(
+                "failed to persist process_wakeup pause reset for session %s",
+                session_id,
+                exc_info=True,
+            )
+    _paused_wakeup = None
+    if turn_source == "process_wakeup":
+        _credential_state_changed = False
+        try:
+            _credential_state_changed = process_wakeup_pause_credential_state_changed(s)
+        except Exception:
+            logger.debug(
+                "failed to compare process_wakeup credential state for session %s",
+                session_id,
+                exc_info=True,
+            )
+        if process_wakeup_pause_matches(
+            s,
+            model=model,
+            provider=model_provider,
+            classification='credential_pool_empty',
+        ):
+            _credential_recovered = False
+            _credential_revalidation_provider = _process_wakeup_revalidation_provider(
+                model,
+                model_provider,
+            )
+            try:
+                _credential_recovered = _process_wakeup_provider_has_usable_credential(
+                    s,
+                    model=model,
+                    provider=model_provider,
+                    provider_id=_credential_revalidation_provider,
+                )
+            except Exception:
+                logger.debug(
+                    "failed to revalidate process_wakeup credential availability for session %s",
+                    session_id,
+                    exc_info=True,
+                )
+            _allow_empty_provider_probe = (
+                _credential_state_changed
+                and not _credential_revalidation_provider
+            )
+            if _credential_recovered or _allow_empty_provider_probe:
+                _recovery_reason = (
+                    'credential_state_changed'
+                    if _credential_state_changed
+                    else 'credential_recovered'
+                )
+                if clear_process_wakeup_pause(s, reason=_recovery_reason):
+                    try:
+                        s.save(touch_updated_at=False)
+                    except Exception:
+                        logger.debug(
+                            "failed to persist process_wakeup credential recovery reset for session %s",
+                            session_id,
+                            exc_info=True,
+                        )
+            elif _credential_state_changed:
+                if _refresh_process_wakeup_pause_credential_fingerprint(s):
+                    try:
+                        s.save(touch_updated_at=False)
+                    except Exception:
+                        logger.debug(
+                            "failed to persist process_wakeup credential-state fingerprint refresh for session %s",
+                            session_id,
+                            exc_info=True,
+                        )
+        _paused_wakeup = suppress_process_wakeup_for_provider_pause(
+            s,
+            model=model,
+            provider=model_provider,
+            classification='credential_pool_empty',
+        )
+    if _paused_wakeup is not None:
+        try:
+            PENDING_BG_TASK_COMPLETIONS.discard(s.session_id)
+        except Exception:
+            logger.debug(
+                "failed to discard pending bg-task marker for paused wakeup %s",
+                session_id,
+                exc_info=True,
+            )
+        try:
+            s.save(touch_updated_at=False)
+        except Exception:
+            logger.debug(
+                "failed to persist process_wakeup suppression for session %s",
+                session_id,
+                exc_info=True,
+            )
+        return {
+            "error": PROCESS_WAKEUP_PAUSE_ERROR,
+            "message": (
+                "Automatic process wakeups are paused for this session because "
+                "the provider credential pool is unavailable."
+            ),
+            "process_wakeup_pause": _paused_wakeup,
+            "_status": 409,
+        }
     resp = _start_run(
         s,
         msg=msg,
@@ -19903,7 +20080,7 @@ def start_session_turn(
         model=model,
         model_provider=model_provider,
         normalized_model=normalized_model,
-        source="process_wakeup",
+        source=turn_source,
         route="start_session_turn",
     )
 

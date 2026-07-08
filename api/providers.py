@@ -1305,6 +1305,21 @@ def _get_provider_api_key(provider_id: str) -> str | None:
     return None
 
 
+def provider_has_usable_credential(provider_id: str, *, refresh: bool = False) -> bool:
+    """Return True when a provider has a currently usable configured credential."""
+    provider = str(provider_id or "").strip().lower()
+    if not provider:
+        return False
+    if refresh:
+        try:
+            from api.config import invalidate_credential_pool_cache
+
+            invalidate_credential_pool_cache(provider)
+        except Exception:
+            logger.debug("Failed to refresh credential pool before provider availability check", exc_info=True)
+    return _get_provider_api_key(provider) is not None
+
+
 def _active_provider_id() -> str | None:
     cfg = get_config()
     model_cfg = cfg.get("model", {})

@@ -30,7 +30,7 @@ from api.config import (
     update_active_run,
 )
 from api.helpers import _redact_text, redact_session_data
-from api.models import get_session, merge_session_messages_append_only
+from api.models import clear_process_wakeup_pause, get_session, merge_session_messages_append_only
 from api.run_journal import RunJournalWriter
 
 logger = logging.getLogger(__name__)
@@ -826,6 +826,12 @@ def _run_gateway_chat_streaming(
             s = get_session(session_id)
             if not _stream_writeback_is_current(s, stream_id):
                 return
+            # A late Stop can land after Gateway has yielded a full answer but
+            # before success writeback. Treat it as cancellation so any
+            # credential-exhausted process-wakeup pause stays in place.
+            if cancel_event.is_set():
+                put_gateway_event("cancel", {"message": "Cancelled by user"})
+                return
             now = time.time()
             # Preserve subsecond ordering for gateway-backed turns. Using an
             # integer seconds timestamp gives the user and assistant rows the
@@ -842,6 +848,7 @@ def _run_gateway_chat_streaming(
             saved_reasoning = STREAM_REASONING_TEXT.get(stream_id, "")
             if saved_reasoning:
                 assistant_msg["reasoning"] = saved_reasoning
+            previous_messages = list(getattr(s, "messages", None) or [])
             previous_context = list(getattr(s, "context_messages", None) or getattr(s, "messages", None) or [])
             # Stamp stable ids on the two new rows (shared with the display merge
             # below) so display and model-context copies share an id for the
@@ -869,7 +876,7 @@ def _run_gateway_chat_streaming(
                 logger.debug("Failed to filter gateway display context markers", exc_info=True)
                 display_context = previous_context
             display = merge_session_messages_append_only(
-                list(getattr(s, "messages", None) or []),
+                previous_messages,
                 display_context,
             )
             try:
@@ -901,6 +908,15 @@ def _run_gateway_chat_streaming(
             s.workspace = str(workspace)
             s.model = model
             s.model_provider = model_provider
+            # Recheck immediately before clearing the pause; Stop can arrive
+            # while the success transcript is being assembled.
+            if cancel_event.is_set():
+                s.context_messages = previous_context
+                s.messages = previous_messages
+                s.save()
+                put_gateway_event("cancel", {"message": "Cancelled by user"})
+                return
+            clear_process_wakeup_pause(s, reason="run_completed")
             s.save()
         try:
             from api.goals import evaluate_goal_after_turn, has_active_goal

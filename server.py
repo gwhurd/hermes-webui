@@ -1,4 +1,5 @@
 """Hermes Web UI server entry point."""
+import json
 import logging
 import os
 import re
@@ -113,6 +114,269 @@ from api.routes import handle_delete, handle_get, handle_patch, handle_post, han
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
+
+# ── External Chat API (API-key-authenticated, for Vault over Tailscale) ──────
+# Read once at import time; if unset, /api/chat/external returns 404 (disabled).
+_EXTERNAL_API_KEY = os.environ.get("HERMES_EXTERNAL_API_KEY", "")
+
+
+def _check_external_auth(handler) -> bool:
+    """Return True when the request carries the expected Bearer token."""
+    if not _EXTERNAL_API_KEY:
+        return False  # endpoint disabled
+    auth = handler.headers.get("Authorization", "")
+    return auth == f"Bearer {_EXTERNAL_API_KEY}"
+
+
+def _sse_write(handler, data: dict) -> None:
+    """Write one SSE data frame and flush so the client sees it immediately."""
+    handler.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8"))
+    handler.wfile.flush()
+
+
+def _handle_external_chat(handler) -> bool:
+    """POST /api/chat/external — API-key-authenticated SSE chat for Vault.
+
+    Bypasses browser session auth (checked in _handle_write). Uses a simple
+    Bearer token against HERMES_EXTERNAL_API_KEY. Runs the agent synchronously
+    and streams the result as SSE delta/done events.
+    """
+    # 1. Auth / disabled check
+    if not _EXTERNAL_API_KEY:
+        return j(handler, {"error": "not found"}, status=404)
+    if not _check_external_auth(handler):
+        return j(handler, {"error": "unauthorized"}, status=401)
+
+    # 2. Read & parse JSON body
+    try:
+        raw_length = handler.headers.get("Content-Length", 0)
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            handler.close_connection = True
+            return j(handler, {"error": "invalid Content-Length"}, status=400)
+        if length > 20 * 1024 * 1024:
+            return j(handler, {"error": "body too large"}, status=413)
+        raw = handler.rfile.read(length) if length > 0 else b""
+        body = json.loads(raw.decode("utf-8")) if raw else {}
+    except Exception as exc:
+        return j(handler, {"error": f"invalid JSON body: {exc}"}, status=400)
+
+    # 3. Validate request
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return j(handler, {"error": "messages must be a non-empty array"}, status=400)
+
+    # Extract the last user message (the prompt to send to the agent)
+    user_msg = ""
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            user_msg = str(m.get("content", "")).strip()
+            break
+    if not user_msg:
+        return j(handler, {"error": "no user message found"}, status=400)
+
+    session_id = str(body.get("session_id") or "").strip()
+    requested_profile = str(body.get("profile") or "default").strip()
+
+    # 4. Set request profile so session/agent infrastructure uses the right home
+    try:
+        set_request_profile(requested_profile)
+    except Exception:
+        pass
+
+    # 5. Resolve or create session
+    try:
+        from api.models import get_session, new_session
+
+        if session_id:
+            try:
+                s = get_session(session_id)
+            except (KeyError, FileNotFoundError):
+                s = new_session(profile=requested_profile)
+                session_id = s.session_id
+        else:
+            s = new_session(profile=requested_profile)
+            session_id = s.session_id
+    except Exception as exc:
+        logger.error("[external-chat] session setup failed: %s", exc, exc_info=True)
+        return j(handler, {"error": "session setup failed"}, status=500)
+
+    # 6. Resolve model/provider (profile defaults, matching _handle_chat_sync)
+    try:
+        from api.config import (
+            resolve_model_provider,
+            resolve_custom_provider_connection,
+            model_with_provider_context,
+            _resolve_cli_toolsets,
+        )
+        from api.routes import (
+            _read_profile_model_config,
+            _resolve_compatible_session_model_state,
+            CHAT_LOCK,
+            _get_session_agent_lock,
+        )
+    except ImportError as exc:
+        logger.error("[external-chat] import failed: %s", exc, exc_info=True)
+        return j(handler, {"error": "server configuration error"}, status=500)
+
+    # 7. Begin SSE response — we'll stream events from here on
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Connection", "close")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    from api.sse_chunked import end_sse_headers
+    end_sse_headers(handler)
+
+    def _send_error(msg: str) -> None:
+        try:
+            _sse_write(handler, {"type": "error", "content": msg, "session_id": session_id})
+        except _CLIENT_DISCONNECT_ERRORS:
+            pass
+
+    # Tell the caller which session this turn belongs to (needed to resume:
+    # Vault stores this and sends it back as session_id on the next call).
+    try:
+        _sse_write(handler, {"type": "session", "session_id": session_id})
+    except _CLIENT_DISCONNECT_ERRORS:
+        clear_request_profile()
+        return True
+
+    # 8. Resolve model state and run the agent
+    try:
+        with _get_session_agent_lock(s.session_id):
+            _sync_requested_provider = getattr(s, "model_provider", None)
+            _pp_provider, _pp_default, _pp_cfg = _read_profile_model_config(
+                s, _sync_requested_provider
+            )
+            model, model_provider = _resolve_compatible_session_model_state(
+                getattr(s, "model", None),
+                _sync_requested_provider,
+                profile_provider=_pp_provider,
+                profile_default_model=_pp_default,
+                profile_config=_pp_cfg,
+            )[:2]
+            s.model = model
+            s.model_provider = model_provider
+
+        from api.streaming import _ENV_LOCK
+
+        with _ENV_LOCK:
+            old_cwd = os.environ.get("TERMINAL_CWD")
+            os.environ["TERMINAL_CWD"] = str(s.workspace)
+            old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
+            old_session_key = os.environ.get("HERMES_SESSION_KEY")
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = s.session_id
+
+        try:
+            from run_agent import AIAgent
+            from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
+
+            with CHAT_LOCK:
+                _model, _provider, _base_url = resolve_model_provider(
+                    model_with_provider_context(s.model, getattr(s, "model_provider", None))
+                )
+                _api_key = None
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                    _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                        resolve_runtime_provider,
+                        requested=_provider,
+                    )
+                    _api_key = _rt.get("api_key")
+                    if not _provider:
+                        _provider = _rt.get("provider")
+                    if not _base_url:
+                        _base_url = _rt.get("base_url")
+                except Exception as _e:
+                    print(f"[external-chat] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
+                if isinstance(_provider, str) and _provider.startswith("custom:"):
+                    _cp_key, _cp_base = resolve_custom_provider_connection(_provider)
+                    if not _api_key and _cp_key:
+                        _api_key = _cp_key
+                    if not _base_url and _cp_base:
+                        _base_url = _cp_base
+
+                agent = AIAgent(
+                    model=_model,
+                    provider=_provider,
+                    base_url=_base_url,
+                    api_key=_api_key,
+                    platform="webui",
+                    quiet_mode=True,
+                    enabled_toolsets=_resolve_cli_toolsets(),
+                    session_id=s.session_id,
+                )
+
+                # Build conversation history from incoming messages (excluding
+                # the last user message which is sent as user_message)
+                conversation_history = []
+                for m in messages[:-1]:
+                    if isinstance(m, dict):
+                        conversation_history.append({
+                            "role": m.get("role", "user"),
+                            "content": str(m.get("content", "")),
+                        })
+
+                result = agent.run_conversation(
+                    user_message=user_msg,
+                    conversation_history=conversation_history,
+                    task_id=s.session_id,
+                    persist_user_message=user_msg,
+                )
+        finally:
+            with _ENV_LOCK:
+                if old_cwd is None:
+                    os.environ.pop("TERMINAL_CWD", None)
+                else:
+                    os.environ["TERMINAL_CWD"] = old_cwd
+                if old_exec_ask is None:
+                    os.environ.pop("HERMES_EXEC_ASK", None)
+                else:
+                    os.environ["HERMES_EXEC_ASK"] = old_exec_ask
+                if old_session_key is None:
+                    os.environ.pop("HERMES_SESSION_KEY", None)
+                else:
+                    os.environ["HERMES_SESSION_KEY"] = old_session_key
+
+        final_response = result.get("final_response") or ""
+
+        # 9. Stream the response as SSE
+        # Send the full response as a single delta (synchronous run), then done.
+        # Chunking it into smaller pieces gives a streaming feel.
+        _CHUNK_SIZE = 80  # characters per delta event
+        for i in range(0, len(final_response), _CHUNK_SIZE):
+            chunk = final_response[i : i + _CHUNK_SIZE]
+            _sse_write(handler, {"type": "delta", "content": chunk})
+
+        _sse_write(handler, {"type": "done", "content": final_response, "session_id": session_id})
+
+        # 10. Persist session state (matching _handle_chat_sync)
+        with _get_session_agent_lock(s.session_id):
+            result_messages = result.get("messages") or []
+            if result_messages:
+                s.messages = result_messages
+            if s.title == "Untitled":
+                try:
+                    from api.models import title_from
+                    s.title = title_from(s.messages, s.title)
+                except Exception:
+                    pass
+            s.save()
+
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass  # client went away — nothing more to do
+    except Exception as exc:
+        logger.error("[external-chat] agent run failed: %s", exc, exc_info=True)
+        _send_error(f"agent error: {exc}")
+    finally:
+        clear_request_profile()
+
+    return True
 
 
 class QuietHTTPServer(ThreadingHTTPServer):
@@ -407,7 +671,19 @@ class Handler(BaseHTTPRequestHandler):
             _is_csp_report_post = (
                 parsed.path == "/api/csp-report" and self.command == "POST"
             )
-            if not _is_csp_report_post and not check_auth(self, parsed): return
+            # External chat endpoint uses API-key auth, bypasses browser session auth
+            _is_external_chat_post = (
+                parsed.path == "/api/chat/external" and self.command == "POST"
+            )
+            if (
+                not _is_csp_report_post
+                and not _is_external_chat_post
+                and not check_auth(self, parsed)
+            ):
+                return
+            if _is_external_chat_post:
+                _handle_external_chat(self)
+                return
             result = route_func(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)

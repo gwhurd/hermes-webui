@@ -3180,6 +3180,12 @@ def _cached_session_lags_disk(cached) -> bool:
                 disk_scenes = disk_meta_quick.get('anchor_activity_scenes') or {}
                 if isinstance(disk_scenes, dict) and disk_scenes:
                     return True
+            else:
+                # Prefix read failed (may still succeed via index fallback for
+                # message count). Mark inconclusive so we fall through to the
+                # full metadata comparison instead of returning False with
+                # stale cache. Greptile P1 (discussion_r3548650345).
+                _scene_check_inconclusive = True
         if getattr(cached, 'active_stream_id', None) or getattr(cached, 'pending_user_message', None):
             # Active session: messages may be in flight; fall through to the
             # full check to be safe.

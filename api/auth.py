@@ -831,6 +831,14 @@ def reset_trusted_auth_request_state(handler) -> None:
         '_trusted_auth_session_rejected',
         '_trusted_auth_session_info',
         '_trusted_auth_session_cookie_value',
+        # Pending Set-Cookie headers are request-scoped: they are queued during a
+        # request and flushed by the response (helpers.flush_pending_cookies). On a
+        # persistent HTTP/1.1 connection a queued-but-unflushed cookie (e.g. a
+        # logout-with-changed-identity that queues a replacement trusted cookie then
+        # invalidates it) would otherwise survive on the reused handler and be flushed
+        # onto a LATER response — clobbering a legitimate fresh cookie (e.g. a
+        # just-succeeded password login) and 401-ing the next protected request.
+        '_pending_set_cookies',
     ):
         try:
             delattr(handler, name)

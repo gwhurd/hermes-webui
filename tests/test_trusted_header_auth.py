@@ -468,6 +468,32 @@ def test_server_resets_trusted_auth_request_state_per_request():
     assert server_source.count("reset_trusted_auth_request_state(self)") == 2
 
 
+def test_pending_cookies_do_not_leak_across_keepalive_requests(monkeypatch):
+    """A cookie queued but not flushed during one request must not survive the
+    per-request reset onto a reused keep-alive handler, where a later response
+    would flush it and clobber a legitimate fresh cookie (e.g. a just-succeeded
+    password login) — silently 401-ing the next protected request.
+
+    Regression for the keep-alive Set-Cookie leak: reset_trusted_auth_request_state
+    must clear _pending_set_cookies, not just the trusted-session scalars.
+    """
+    _trusted_env(monkeypatch)
+    handler = _Handler(headers={"Remote-User": "alice"})
+
+    # Request A queues a trusted-session cookie that is never flushed to a response
+    # (e.g. a logout-with-changed-identity that queues a replacement then invalidates
+    # it, or any early-return path before flush_pending_cookies runs).
+    auth._queue_pending_cookie(handler, "hermes_session=stale-queued-value; Path=/")
+    assert handler._pending_set_cookies == ["hermes_session=stale-queued-value; Path=/"]
+
+    # Request B begins on the SAME persistent handler → the per-request reset fires.
+    auth.reset_trusted_auth_request_state(handler)
+
+    # The stale queued cookie must be gone so it cannot be flushed onto request B's
+    # response. getattr default guards the delattr-based reset.
+    assert getattr(handler, "_pending_set_cookies", []) == []
+
+
 def test_auth_status_reports_reconciled_trusted_identity(monkeypatch):
     _trusted_env(
         monkeypatch,

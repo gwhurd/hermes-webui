@@ -5757,6 +5757,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('apperror',e=>{
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      let d={};
+      try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
+      const _genericNoResponseAfterAssistantText=(
+        (d.type==='no_response'||d.type==='silent_failure')&&String(assistantText||'').trim()
+      );
+      // A generic fallback can arrive after the completed answer was already
+      // streamed. Settle from the persisted transcript instead of replacing
+      // that answer with a misleading provider-error card.
+      if(_genericNoResponseAfterAssistantText){
+        _restoreSettledSession(source,{preserveVisibleOnShorterTerminalSnapshot:true});
+        return;
+      }
       _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
@@ -5775,8 +5787,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _clearStreamNotificationBackground(activeSid, streamId);
       _clearApprovalForOwner();
       _clearClarifyForOwner('terminal');
-      let d={};
-      try{ d=JSON.parse(e.data||'{}')||{}; }catch(_){ d={}; }
       const currentSid=S.session&&S.session.session_id;
       const eventSid=d.old_session_id||d.session_id||'';
       const continuationSid=(d.session&&d.session.session_id)||d.new_session_id||d.continuation_session_id||'';

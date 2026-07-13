@@ -49,6 +49,58 @@ def test_messages_array_validated():
     assert "no user message found" in body
 
 
+def test_vault_requires_nonblank_actor_context_before_sse():
+    """Vault turns must reject invalid identity context before SSE begins."""
+    body = SRC[SRC.index("def _handle_external_chat") :]
+    validation = body[: body.index("# 7. Begin SSE response")]
+    assert 'body.get("actor_context")' in validation
+    assert 'requested_profile == "vault"' in validation
+    assert 'actor_context.get("clerk_user_id")' in validation
+    assert 'actor_context.get("convex_token")' in validation
+    assert 'not isinstance(clerk_user_id, str)' in validation
+    assert 'not clerk_user_id.strip()' in validation
+    assert 'not isinstance(convex_token, str)' in validation
+    assert 'not convex_token.strip()' in validation
+    assert "vault actor context is required" in validation
+
+
+def test_vault_actor_env_is_scoped_to_serialized_agent_work():
+    """Only Vault turns receive actor env, and only while CHAT_LOCK is held."""
+    body = SRC[SRC.index("def _handle_external_chat") : SRC.index("class QuietHTTPServer")]
+    chat_lock = body.index("with CHAT_LOCK:")
+    agent_ctor = body.index("agent = AIAgent(")
+    agent_run = body.index("result = agent.run_conversation(")
+    convex_set = body.index('os.environ["CONVEX_USER_TOKEN"]')
+    vault_id_set = body.index('os.environ["VAULT_USER_ID"]')
+    assert chat_lock < convex_set < agent_ctor < agent_run
+    assert chat_lock < vault_id_set < agent_ctor < agent_run
+    assert "if vault_actor_env:" in body[:convex_set]
+
+
+def test_vault_actor_env_is_restored_in_existing_finally():
+    """Both prior values, including absence, are restored after success or failure."""
+    body = SRC[SRC.index("def _handle_external_chat") : SRC.index("class QuietHTTPServer")]
+    finally_idx = body.index("finally:")
+    tail = body[finally_idx:]
+    agent_run = body.index("result = agent.run_conversation(")
+    for var in ("CONVEX_USER_TOKEN", "VAULT_USER_ID"):
+        assert f'old_{var.lower()}' in body
+        assert f'os.environ.pop("{var}", None)' in tail
+        assert f'os.environ["{var}"] = old_{var.lower()}' in tail
+        assert agent_run < body.index(f'os.environ.pop("{var}", None)')
+
+
+def test_actor_token_is_not_added_to_messages_sse_or_errors():
+    """The actor token is process-only and never enters a persisted/output payload."""
+    body = SRC[SRC.index("def _handle_external_chat") : SRC.index("class QuietHTTPServer")]
+    assert "persist_user_message=user_msg" in body
+    assert "final_response = _redact_actor_token(" in body
+    assert "result_messages = _redact_actor_token(" in body
+    # Vault failures must not serialize an exception that could contain env data.
+    assert '_send_error("agent error")' in body
+    assert 'print("[external-chat] WARNING: resolve_runtime_provider failed"' in body
+
+
 def test_sse_event_shapes():
     body = SRC[SRC.index("def _handle_external_chat") :]
     assert '"type": "session", "session_id": session_id' in body

@@ -163,6 +163,26 @@ def _handle_external_chat(handler) -> bool:
         return j(handler, {"error": f"invalid JSON body: {exc}"}, status=400)
 
     # 3. Validate request
+    requested_profile = str(body.get("profile") or "default").strip()
+    vault_actor_env = requested_profile == "vault"
+    clerk_user_id = ""
+    convex_token = ""
+    if vault_actor_env:
+        actor_context = body.get("actor_context")
+        if not isinstance(actor_context, dict):
+            return j(handler, {"error": "vault actor context is required"}, status=400)
+        clerk_user_id = actor_context.get("clerk_user_id")
+        convex_token = actor_context.get("convex_token")
+        if (
+            not isinstance(clerk_user_id, str)
+            or not clerk_user_id.strip()
+            or not isinstance(convex_token, str)
+            or not convex_token.strip()
+        ):
+            return j(handler, {"error": "vault actor context is required"}, status=400)
+        clerk_user_id = clerk_user_id.strip()
+        convex_token = convex_token.strip()
+
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         return j(handler, {"error": "messages must be a non-empty array"}, status=400)
@@ -177,7 +197,18 @@ def _handle_external_chat(handler) -> bool:
         return j(handler, {"error": "no user message found"}, status=400)
 
     session_id = str(body.get("session_id") or "").strip()
-    requested_profile = str(body.get("profile") or "default").strip()
+
+    def _redact_actor_token(value):
+        """Keep the Vault actor token process-only if an agent ever echoes it."""
+        if not vault_actor_env:
+            return value
+        if isinstance(value, str):
+            return value.replace(convex_token, "[redacted]")
+        if isinstance(value, list):
+            return [_redact_actor_token(item) for item in value]
+        if isinstance(value, dict):
+            return {key: _redact_actor_token(item) for key, item in value.items()}
+        return value
 
     # 4. Set request profile so session/agent infrastructure uses the right home
     try:
@@ -271,63 +302,87 @@ def _handle_external_chat(handler) -> bool:
             os.environ["HERMES_EXEC_ASK"] = "1"
             os.environ["HERMES_SESSION_KEY"] = s.session_id
 
+        old_convex_user_token = None
+        old_vault_user_id = None
         try:
             from run_agent import AIAgent
             from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
 
             with CHAT_LOCK:
-                _model, _provider, _base_url = resolve_model_provider(
-                    model_with_provider_context(s.model, getattr(s, "model_provider", None))
-                )
-                _api_key = None
                 try:
-                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    if vault_actor_env:
+                        with _ENV_LOCK:
+                            old_convex_user_token = os.environ.get("CONVEX_USER_TOKEN")
+                            old_vault_user_id = os.environ.get("VAULT_USER_ID")
+                            os.environ["CONVEX_USER_TOKEN"] = convex_token
+                            os.environ["VAULT_USER_ID"] = clerk_user_id
 
-                    _rt = resolve_runtime_provider_with_anthropic_env_lock(
-                        resolve_runtime_provider,
-                        requested=_provider,
+                    _model, _provider, _base_url = resolve_model_provider(
+                        model_with_provider_context(s.model, getattr(s, "model_provider", None))
                     )
-                    _api_key = _rt.get("api_key")
-                    if not _provider:
-                        _provider = _rt.get("provider")
-                    if not _base_url:
-                        _base_url = _rt.get("base_url")
-                except Exception as _e:
-                    print(f"[external-chat] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
-                if isinstance(_provider, str) and _provider.startswith("custom:"):
-                    _cp_key, _cp_base = resolve_custom_provider_connection(_provider)
-                    if not _api_key and _cp_key:
-                        _api_key = _cp_key
-                    if not _base_url and _cp_base:
-                        _base_url = _cp_base
+                    _api_key = None
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
 
-                agent = AIAgent(
-                    model=_model,
-                    provider=_provider,
-                    base_url=_base_url,
-                    api_key=_api_key,
-                    platform="webui",
-                    quiet_mode=True,
-                    enabled_toolsets=_resolve_cli_toolsets(),
-                    session_id=s.session_id,
-                )
+                        _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                            resolve_runtime_provider,
+                            requested=_provider,
+                        )
+                        _api_key = _rt.get("api_key")
+                        if not _provider:
+                            _provider = _rt.get("provider")
+                        if not _base_url:
+                            _base_url = _rt.get("base_url")
+                    except Exception as _e:
+                        if vault_actor_env:
+                            print("[external-chat] WARNING: resolve_runtime_provider failed", flush=True)
+                        else:
+                            print(f"[external-chat] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
+                    if isinstance(_provider, str) and _provider.startswith("custom:"):
+                        _cp_key, _cp_base = resolve_custom_provider_connection(_provider)
+                        if not _api_key and _cp_key:
+                            _api_key = _cp_key
+                        if not _base_url and _cp_base:
+                            _base_url = _cp_base
 
-                # Build conversation history from incoming messages (excluding
-                # the last user message which is sent as user_message)
-                conversation_history = []
-                for m in messages[:-1]:
-                    if isinstance(m, dict):
-                        conversation_history.append({
-                            "role": m.get("role", "user"),
-                            "content": str(m.get("content", "")),
-                        })
+                    agent = AIAgent(
+                        model=_model,
+                        provider=_provider,
+                        base_url=_base_url,
+                        api_key=_api_key,
+                        platform="webui",
+                        quiet_mode=True,
+                        enabled_toolsets=_resolve_cli_toolsets(),
+                        session_id=s.session_id,
+                    )
 
-                result = agent.run_conversation(
-                    user_message=user_msg,
-                    conversation_history=conversation_history,
-                    task_id=s.session_id,
-                    persist_user_message=user_msg,
-                )
+                    # Build conversation history from incoming messages (excluding
+                    # the last user message which is sent as user_message)
+                    conversation_history = []
+                    for m in messages[:-1]:
+                        if isinstance(m, dict):
+                            conversation_history.append({
+                                "role": m.get("role", "user"),
+                                "content": str(m.get("content", "")),
+                            })
+
+                    result = agent.run_conversation(
+                        user_message=user_msg,
+                        conversation_history=conversation_history,
+                        task_id=s.session_id,
+                        persist_user_message=user_msg,
+                    )
+                finally:
+                    if vault_actor_env:
+                        with _ENV_LOCK:
+                            if old_convex_user_token is None:
+                                os.environ.pop("CONVEX_USER_TOKEN", None)
+                            else:
+                                os.environ["CONVEX_USER_TOKEN"] = old_convex_user_token
+                            if old_vault_user_id is None:
+                                os.environ.pop("VAULT_USER_ID", None)
+                            else:
+                                os.environ["VAULT_USER_ID"] = old_vault_user_id
         finally:
             with _ENV_LOCK:
                 if old_cwd is None:
@@ -343,7 +398,7 @@ def _handle_external_chat(handler) -> bool:
                 else:
                     os.environ["HERMES_SESSION_KEY"] = old_session_key
 
-        final_response = result.get("final_response") or ""
+        final_response = _redact_actor_token(result.get("final_response") or "")
 
         # 9. Stream the response as SSE
         # Send the full response as a single delta (synchronous run), then done.
@@ -357,7 +412,7 @@ def _handle_external_chat(handler) -> bool:
 
         # 10. Persist session state (matching _handle_chat_sync)
         with _get_session_agent_lock(s.session_id):
-            result_messages = result.get("messages") or []
+            result_messages = _redact_actor_token(result.get("messages") or [])
             if result_messages:
                 s.messages = result_messages
             if s.title == "Untitled":
@@ -371,8 +426,12 @@ def _handle_external_chat(handler) -> bool:
     except _CLIENT_DISCONNECT_ERRORS:
         pass  # client went away — nothing more to do
     except Exception as exc:
-        logger.error("[external-chat] agent run failed: %s", exc, exc_info=True)
-        _send_error(f"agent error: {exc}")
+        if vault_actor_env:
+            logger.error("[external-chat] vault agent run failed")
+            _send_error("agent error")
+        else:
+            logger.error("[external-chat] agent run failed: %s", exc, exc_info=True)
+            _send_error(f"agent error: {exc}")
     finally:
         clear_request_profile()
 

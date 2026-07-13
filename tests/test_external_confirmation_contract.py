@@ -17,9 +17,11 @@ from api.external_chat_contract import (
 
 
 TOOL_NAME = "mcp_vault_mcp_vault_start_removal"
+PICKUP_TOOL_NAME = "mcp_vault_mcp_vault_record_removal_pickup"
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 NOW_MS = 1_783_944_000_000
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-departure-confirmation-structured-content.json"
+PICKUP_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-pickup-confirmation-structured-content.json"
 
 
 def _candidate(n: int = 1) -> dict:
@@ -72,6 +74,25 @@ def test_actual_vault_mcp_structured_content_fixture_is_the_accepted_wire_shape(
     fixture = json.loads(FIXTURE_PATH.read_text())
 
     assert confirmation_card_from_current_turn(_turn_with_tool_result(fixture), now=NOW) == fixture
+
+
+def test_actual_vault_mcp_pickup_structured_content_fixture_is_the_accepted_wire_shape():
+    fixture = json.loads(PICKUP_FIXTURE_PATH.read_text())
+
+    assert confirmation_card_from_current_turn(
+        _turn_with_tool_result(fixture, tool_name=PICKUP_TOOL_NAME), now=NOW
+    ) == fixture
+
+
+def test_confirmation_command_must_match_the_current_vault_tool_call():
+    pickup_fixture = json.loads(PICKUP_FIXTURE_PATH.read_text())
+
+    assert confirmation_card_from_current_turn(
+        _turn_with_tool_result(pickup_fixture), now=NOW
+    ) is None
+    assert confirmation_card_from_current_turn(
+        _turn_with_tool_result(_approved_payload(), tool_name=PICKUP_TOOL_NAME), now=NOW
+    ) is None
 
 
 def test_current_vault_tool_result_emits_exact_card_with_at_most_five_candidates():
@@ -196,6 +217,28 @@ def test_external_turn_events_emit_exact_objects_with_one_confirmation_before_do
     assert all(
         all(forbidden not in repr(event) for forbidden in ("convex_token", "clerk_user_id", "caseId", "orgId"))
         for event in events
+    )
+
+
+def test_pickup_turn_emits_one_session_owned_data_only_confirmation_card_before_done():
+    pickup_fixture = json.loads(PICKUP_FIXTURE_PATH.read_text())
+    result = {"messages": _turn_with_tool_result(pickup_fixture, tool_name=PICKUP_TOOL_NAME)}
+
+    events = external_turn_events("Pickup answer", result, "session-pickup", now=NOW)
+
+    assert events == [
+        {"type": "delta", "content": "Pickup answer"},
+        {
+            "type": "confirmation_card",
+            "card": pickup_fixture,
+            "session_id": "session-pickup",
+        },
+        {"type": "done", "content": "Pickup answer", "session_id": "session-pickup"},
+    ]
+    assert all(
+        forbidden not in repr(event)
+        for event in events
+        for forbidden in ("convex_token", "clerk_user_id", "caseId", "orgId", "Authorization")
     )
 
 

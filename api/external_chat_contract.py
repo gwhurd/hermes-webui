@@ -10,10 +10,12 @@ import json
 from typing import Any
 
 
-_VAULT_REMOVAL_TOOL = "mcp_vault_mcp_vault_start_removal"
+_VAULT_REMOVAL_TOOLS = {
+    "mcp_vault_mcp_vault_start_removal": "departure",
+    "mcp_vault_mcp_vault_record_removal_pickup": "pickup",
+}
 _CARD_KIND = "vault.removal_assignment_confirmation"
 _CARD_VERSION = 1
-_CARD_COMMAND = "departure"
 _CARD_KEYS = frozenset({"kind", "version", "command", "issuedAt", "expiresAt", "candidates"})
 _CANDIDATE_KEYS = frozenset({
     "assignmentId", "decedentName", "caseNumber", "source", "scheduledFor", "assignedTeam",
@@ -149,14 +151,14 @@ def _tool_call_name(call: Any) -> str | None:
     return call.get("name") if isinstance(call.get("name"), str) else None
 
 
-def _approved_card(payload: Any, now: datetime) -> dict | None:
+def _approved_card(payload: Any, now: datetime, command: str) -> dict | None:
     if not isinstance(payload, dict) or set(payload) != _CARD_KEYS:
         return None
     if (
         payload.get("kind") != _CARD_KIND
         or type(payload.get("version")) is not int
         or payload.get("version") != _CARD_VERSION
-        or payload.get("command") != _CARD_COMMAND
+        or payload.get("command") != command
     ):
         return None
     issued_at = _safe_unix_milliseconds(payload.get("issuedAt"))
@@ -186,7 +188,7 @@ def _approved_card(payload: Any, now: datetime) -> dict | None:
     return {
         "kind": _CARD_KIND,
         "version": _CARD_VERSION,
-        "command": _CARD_COMMAND,
+        "command": command,
         "issuedAt": payload["issuedAt"],
         "expiresAt": payload["expiresAt"],
         "candidates": approved_candidates,
@@ -194,7 +196,7 @@ def _approved_card(payload: Any, now: datetime) -> dict | None:
 
 
 def confirmation_card_from_current_turn(messages: Any, *, now: datetime | None = None) -> dict | None:
-    """Return a validated departure card from the final user turn's final Vault tool row.
+    """Return a validated card from the final user turn's final Vault tool row.
 
     Assistant prose, historic rows, unrelated tools, and malformed MCP envelopes
     are deliberately ignored.  The final matching row is authoritative so an
@@ -211,28 +213,37 @@ def confirmation_card_from_current_turn(messages: Any, *, now: datetime | None =
     if current_turn_start is None:
         return None
 
-    called_ids: set[str] = set()
-    matching_rows: list[dict] = []
+    called_commands: dict[str, str] = {}
+    matching_rows: list[tuple[dict, str]] = []
     for row in messages[current_turn_start + 1 :]:
         if not isinstance(row, dict):
             continue
         if row.get("role") == "assistant":
             for call in row.get("tool_calls") or []:
-                if _tool_call_name(call) == _VAULT_REMOVAL_TOOL and isinstance(call, dict):
-                    call_id = call.get("id")
-                    if isinstance(call_id, str) and call_id:
-                        called_ids.add(call_id)
+                if not isinstance(call, dict):
+                    continue
+                tool_call_name = _tool_call_name(call)
+                command = _VAULT_REMOVAL_TOOLS.get(tool_call_name) if tool_call_name else None
+                call_id = call.get("id")
+                if command is not None and isinstance(call_id, str) and call_id:
+                    called_commands[call_id] = command
             continue
+        tool_name = row.get("name")
+        tool_call_id = row.get("tool_call_id")
+        command = called_commands.get(tool_call_id) if isinstance(tool_call_id, str) else None
         if (
             row.get("role") == "tool"
-            and row.get("name") == _VAULT_REMOVAL_TOOL
-            and row.get("tool_name", _VAULT_REMOVAL_TOOL) == _VAULT_REMOVAL_TOOL
-            and row.get("tool_call_id") in called_ids
+            and isinstance(tool_name, str)
+            and command is not None
+            and _VAULT_REMOVAL_TOOLS.get(tool_name) == command
+            and row.get("tool_name", tool_name) == tool_name
         ):
-            matching_rows.append(row)
+            matching_rows.append((row, command))
     if not matching_rows:
         return None
+    tool_row, command = matching_rows[-1]
     return _approved_card(
-        _structured_content_from_tool_row(matching_rows[-1]),
+        _structured_content_from_tool_row(tool_row),
         now or datetime.now(timezone.utc),
+        command,
     )

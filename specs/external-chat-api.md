@@ -65,8 +65,22 @@ The emitted objects are exactly:
 
 `confirmation_card` is emitted at most once, after all `delta` objects and
 before `done`. It is authoritative only when the current turn's matching
-`vault_start_removal` MCP result has an approved `structuredContent` envelope;
+Vault removal MCP result (`vault_start_removal`, `vault_record_removal_pickup`,
+or `vault_complete_removal`) has an approved `structuredContent` envelope;
 assistant prose, JSON-looking prose, and historic results never create a card.
+
+### POST `/api/chat/external/confirmation-context`
+
+This API-key-authenticated, server-to-server lookup exists only for `pickup`
+and `return` cards. Vault submits the exact object
+`{clerk_user_id, session_id, command, card_fingerprint, candidate_ids}`. The
+WebUI returns normalized original command facts only when the persisted Vault
+session owner, command, canonical SHA-256 card fingerprint, ordered unique
+candidate IDs, and upstream expiry all match. Disabled service returns 404,
+invalid API key returns 401, and every unknown/malformed/stale/mismatched
+request returns generic 404. The browser never receives these facts or lookup
+tokens; departure is context-free. This endpoint intentionally reuses the
+existing allowlisted CORS behavior and adds no permissive CORS header.
 
 The `card` is a strict allowlisted projection of the MCP
 `structuredContent`: it has exactly the keys shown above and every candidate

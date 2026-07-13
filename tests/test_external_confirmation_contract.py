@@ -9,7 +9,11 @@ from pathlib import Path
 import server
 from api.external_chat_contract import (
     bind_vault_external_session_owner,
+    card_fingerprint,
+    confirmation_card_and_context_from_current_turn,
+    confirmation_context_for_request,
     confirmation_card_from_current_turn,
+    clear_confirmation_context_registry_for_tests,
     external_turn_events,
     resolve_external_session,
     vault_external_session_owned_by,
@@ -18,10 +22,12 @@ from api.external_chat_contract import (
 
 TOOL_NAME = "mcp_vault_mcp_vault_start_removal"
 PICKUP_TOOL_NAME = "mcp_vault_mcp_vault_record_removal_pickup"
+RETURN_TOOL_NAME = "mcp_vault_mcp_vault_complete_removal"
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 NOW_MS = 1_783_944_000_000
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-departure-confirmation-structured-content.json"
 PICKUP_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-pickup-confirmation-structured-content.json"
+RETURN_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-return-confirmation-structured-content.json"
 
 
 def _candidate(n: int = 1) -> dict:
@@ -46,7 +52,15 @@ def _approved_payload(*, candidates=None, issued_at=None, expires_at=None) -> di
     }
 
 
-def _turn_with_tool_result(payload, *, tool_name=TOOL_NAME, call_id="call-current") -> list[dict]:
+def _arguments_for(tool_name: str) -> dict:
+    if tool_name == PICKUP_TOOL_NAME:
+        return {"decedentQuery": " Henderson ", "sourceCustodyAcknowledged": True, "conditionNotes": " Intact ", "accessNotes": " ", "idempotencyKey": " pickup-key "}
+    if tool_name == RETURN_TOOL_NAME:
+        return {"decedentQuery": " Henderson ", "destination": " Cooler Two ", "notes": " Returned intact ", "idempotencyKey": " return-key "}
+    return {}
+
+
+def _turn_with_tool_result(payload, *, tool_name=TOOL_NAME, call_id="call-current", arguments=None) -> list[dict]:
     return [
         {"role": "user", "content": "old turn"},
         {
@@ -63,7 +77,7 @@ def _turn_with_tool_result(payload, *, tool_name=TOOL_NAME, call_id="call-curren
         {"role": "user", "content": "start the removal"},
         {
             "role": "assistant",
-            "tool_calls": [{"id": call_id, "function": {"name": tool_name, "arguments": "{}"}}],
+            "tool_calls": [{"id": call_id, "function": {"name": tool_name, "arguments": json.dumps(_arguments_for(tool_name) if arguments is None else arguments)}}],
         },
         {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": json.dumps({"structuredContent": payload})},
         {"role": "assistant", "content": "Assistant prose and JSON are not authority."},
@@ -82,6 +96,106 @@ def test_actual_vault_mcp_pickup_structured_content_fixture_is_the_accepted_wire
     assert confirmation_card_from_current_turn(
         _turn_with_tool_result(fixture, tool_name=PICKUP_TOOL_NAME), now=NOW
     ) == fixture
+
+
+def test_actual_vault_mcp_return_fixture_maps_complete_removal_to_return():
+    fixture = json.loads(RETURN_FIXTURE_PATH.read_text())
+
+    assert confirmation_card_from_current_turn(
+        _turn_with_tool_result(fixture, tool_name=RETURN_TOOL_NAME), now=NOW
+    ) == fixture
+
+
+def test_card_candidates_require_canonical_scalars_and_unique_assignment_ids():
+    payload = _approved_payload()
+    for field, value in (
+        ("assignmentId", " assignment-1"),
+        ("decedentName", "x" * 257),
+        ("caseNumber", "x" * 257),
+        ("source", "x" * 257),
+        ("assignedTeam", "x" * 257),
+        ("scheduledFor", "2026-07-14T10:00:00.000Z "),
+    ):
+        candidate = _candidate()
+        candidate[field] = value
+        assert confirmation_card_from_current_turn(
+            _turn_with_tool_result({**payload, "candidates": [candidate]}), now=NOW
+        ) is None
+
+    assert confirmation_card_from_current_turn(
+        _turn_with_tool_result({**payload, "candidates": [_candidate(1), _candidate(1)]}), now=NOW
+    ) is None
+
+
+def test_current_call_arguments_are_strictly_allowlisted_and_normalized_for_server_held_context():
+    pickup = json.loads(PICKUP_FIXTURE_PATH.read_text())
+    card, context = confirmation_card_and_context_from_current_turn(
+        _turn_with_tool_result(pickup, tool_name=PICKUP_TOOL_NAME), now=NOW
+    )
+    assert card == pickup
+    assert context == {
+        "decedentQuery": "Henderson",
+        "sourceCustodyAcknowledged": True,
+        "conditionNotes": "Intact",
+        "idempotencyKey": "pickup-key",
+    }
+
+    return_card = json.loads(RETURN_FIXTURE_PATH.read_text())
+    card, context = confirmation_card_and_context_from_current_turn(
+        _turn_with_tool_result(return_card, tool_name=RETURN_TOOL_NAME), now=NOW
+    )
+    assert card == return_card
+    assert context == {
+        "decedentQuery": "Henderson",
+        "destination": "Cooler Two",
+        "notes": "Returned intact",
+        "idempotencyKey": "return-key",
+    }
+
+    for arguments in (
+        {**_arguments_for(PICKUP_TOOL_NAME), "authority": "director"},
+        {**_arguments_for(PICKUP_TOOL_NAME), "sourceCustodyAcknowledged": "true"},
+        {**_arguments_for(PICKUP_TOOL_NAME), "conditionNotes": "x" * 1001},
+    ):
+        assert confirmation_card_and_context_from_current_turn(
+            _turn_with_tool_result(pickup, tool_name=PICKUP_TOOL_NAME, arguments=arguments), now=NOW
+        ) == (None, None)
+
+
+def test_confirmation_context_registry_requires_persisted_exact_owner_session_card_and_candidates():
+    clear_confirmation_context_registry_for_tests()
+    pickup = json.loads(PICKUP_FIXTURE_PATH.read_text())
+    result = {"messages": _turn_with_tool_result(pickup, tool_name=PICKUP_TOOL_NAME)}
+    events = external_turn_events("Pickup", result, "session-pickup", now=NOW, clerk_user_id="user-A")
+    assert any(event["type"] == "confirmation_card" for event in events)
+    request = {
+        "clerk_user_id": "user-A",
+        "session_id": "session-pickup",
+        "command": "pickup",
+        "card_fingerprint": card_fingerprint(pickup),
+        "candidate_ids": [candidate["assignmentId"] for candidate in pickup["candidates"]],
+    }
+
+    class Session:
+        profile = "vault"
+        external_session_owner = "user-A"
+
+    assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=NOW_MS) == {
+        "decedentQuery": "Henderson",
+        "sourceCustodyAcknowledged": True,
+        "conditionNotes": "Intact",
+        "idempotencyKey": "pickup-key",
+    }
+    for altered in (
+        {**request, "clerk_user_id": "user-B"},
+        {**request, "session_id": "other-session"},
+        {**request, "command": "return"},
+        {**request, "card_fingerprint": "0" * 64},
+        {**request, "candidate_ids": ["assignment-other"]},
+        {**request, "unexpected": True},
+    ):
+        assert confirmation_context_for_request(lambda _sid: Session(), altered, now_ms=NOW_MS) is None
+    assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=pickup["expiresAt"]) is None
 
 
 def test_confirmation_command_must_match_the_current_vault_tool_call():

@@ -113,6 +113,7 @@ from api.helpers import (
 )
 from api.profiles import set_request_profile, clear_request_profile
 from api.external_chat_contract import (
+    confirmation_context_for_request,
     external_turn_events,
     resolve_external_session,
 )
@@ -153,6 +154,30 @@ def _vault_mcp_metadata_scope(convex_token: str | None) -> ContextManager[object
         "vault-mcp",
         {"com.southwestcremation.vault/convex-user-token": convex_token},
     )
+
+
+def _handle_external_confirmation_context(handler) -> bool:
+    """Return a normalized current-command context to Vault's authenticated server only."""
+    if not _EXTERNAL_API_KEY:
+        return j(handler, {"error": "not found"}, status=404)
+    if not _check_external_auth(handler):
+        return j(handler, {"error": "unauthorized"}, status=401)
+    try:
+        length = int(handler.headers.get("Content-Length", 0))
+        if length <= 0 or length > 16 * 1024:
+            return j(handler, {"error": "invalid request"}, status=400)
+        payload = json.loads(handler.rfile.read(length).decode("utf-8"))
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return j(handler, {"error": "invalid request"}, status=400)
+    from api.models import get_session
+    context = confirmation_context_for_request(
+        lambda session_id: get_session(session_id, metadata_only=True),
+        payload,
+        now_ms=int(time.time() * 1000),
+    )
+    if context is None:
+        return j(handler, {"error": "not found"}, status=404)
+    return j(handler, context)
 
 
 def _handle_external_chat(handler) -> bool:
@@ -278,7 +303,6 @@ def _handle_external_chat(handler) -> bool:
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
     handler.send_header("Connection", "close")
-    handler.send_header("Access-Control-Allow-Origin", "*")
     from api.sse_chunked import end_sse_headers
     end_sse_headers(handler)
 
@@ -408,7 +432,9 @@ def _handle_external_chat(handler) -> bool:
 
         # 9. Stream the response as SSE
         # Build delta/card/done events after the synchronous agent run.
-        for event in external_turn_events(final_response, result, session_id):
+        for event in external_turn_events(
+            final_response, result, session_id, clerk_user_id=clerk_user_id
+        ):
             _sse_write(handler, event)
 
         # 10. Persist session state (matching _handle_chat_sync)
@@ -735,11 +761,19 @@ class Handler(BaseHTTPRequestHandler):
             _is_external_chat_post = (
                 parsed.path == "/api/chat/external" and self.command == "POST"
             )
+            _is_external_confirmation_context_post = (
+                parsed.path == "/api/chat/external/confirmation-context"
+                and self.command == "POST"
+            )
             if (
                 not _is_csp_report_post
                 and not _is_external_chat_post
+                and not _is_external_confirmation_context_post
                 and not check_auth(self, parsed)
             ):
+                return
+            if _is_external_confirmation_context_post:
+                _handle_external_confirmation_context(self)
                 return
             if _is_external_chat_post:
                 _handle_external_chat(self)

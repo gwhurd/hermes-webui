@@ -8,6 +8,8 @@ path, and must emit the documented SSE event shapes.
 import re
 from pathlib import Path
 
+import server
+
 SRC = (Path(__file__).resolve().parent.parent / "server.py").read_text()
 
 
@@ -41,6 +43,128 @@ def test_route_intercepted_before_handle_post():
     assert "check_auth" in hw
     # ...and the external handler returns before route_func is invoked
     assert hw.index("_handle_external_chat(") < hw.index("route_func(self, parsed)")
+
+
+def test_confirmation_context_route_uses_the_same_api_key_without_browser_auth_or_cors():
+    hw = SRC[SRC.index("def _handle_write") : SRC.index("def do_POST")]
+    assert '"/api/chat/external/confirmation-context"' in hw
+    assert "_handle_external_confirmation_context(self)" in hw
+    handler = SRC[SRC.index("def _handle_external_confirmation_context") : SRC.index("def _handle_external_chat")]
+    assert "_check_external_auth" in handler
+    assert "confirmation_context_for_request" in handler
+    assert "Access-Control-Allow-Origin" not in handler
+
+
+def test_confirmation_context_handler_authenticates_and_returns_only_the_registry_projection(monkeypatch):
+    import io
+    import json
+    from api import models
+
+    payload = {
+        "clerk_user_id": "user-A",
+        "session_id": "session-A",
+        "command": "return",
+        "card_fingerprint": "a" * 64,
+        "candidate_ids": ["assignment-A"],
+    }
+
+    class Handler:
+        headers = {
+            "Authorization": "Bearer context-key",
+            "Content-Length": str(len(json.dumps(payload).encode())),
+        }
+        rfile = io.BytesIO(json.dumps(payload).encode())
+
+    responses = []
+    observed = {}
+    monkeypatch.setattr(server, "_EXTERNAL_API_KEY", "context-key")
+    monkeypatch.setattr(server, "j", lambda _handler, body, status=200: responses.append((status, body)))
+    monkeypatch.setattr(models, "get_session", lambda sid, metadata_only=False: observed.update(session=(sid, metadata_only)) or object())
+
+    def resolve(get_session, request_payload, *, now_ms):
+        observed["loaded"] = get_session(request_payload["session_id"])
+        observed["payload"] = request_payload
+        observed["now_ms"] = now_ms
+        return {"decedentQuery": "Henderson", "destination": "Cooler Two", "idempotencyKey": "return-key"}
+
+    monkeypatch.setattr(server, "confirmation_context_for_request", resolve)
+
+    server._handle_external_confirmation_context(Handler())
+
+    assert responses == [(200, {"decedentQuery": "Henderson", "destination": "Cooler Two", "idempotencyKey": "return-key"})]
+    assert observed["session"] == ("session-A", True)
+    assert observed["payload"] == payload
+    assert "convex_token" not in repr(responses)
+
+
+def test_confirmation_context_handler_fails_closed_without_leaking_lookup_data(monkeypatch):
+    import io
+    import json
+
+    payload = {
+        "clerk_user_id": "user-A",
+        "session_id": "session-A",
+        "command": "return",
+        "card_fingerprint": "a" * 64,
+        "candidate_ids": ["assignment-A"],
+    }
+
+    class Handler:
+        headers = {
+            "Authorization": "Bearer wrong-key",
+            "Content-Length": str(len(json.dumps(payload).encode())),
+        }
+        rfile = io.BytesIO(json.dumps(payload).encode())
+
+    responses = []
+    monkeypatch.setattr(server, "_EXTERNAL_API_KEY", "context-key")
+    monkeypatch.setattr(server, "j", lambda _handler, body, status=200: responses.append((status, body)))
+    monkeypatch.setattr(
+        server,
+        "confirmation_context_for_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unauthenticated lookup must not run")),
+    )
+
+    server._handle_external_confirmation_context(Handler())
+
+    assert responses == [(401, {"error": "unauthorized"})]
+    serialized = repr(responses)
+    assert "user-A" not in serialized
+    assert "assignment-A" not in serialized
+    assert "context-key" not in serialized
+
+
+def test_confirmation_context_handler_returns_generic_not_found_for_binding_mismatch(monkeypatch):
+    import io
+    import json
+
+    payload = {
+        "clerk_user_id": "user-A",
+        "session_id": "session-A",
+        "command": "return",
+        "card_fingerprint": "a" * 64,
+        "candidate_ids": ["assignment-A"],
+    }
+
+    class Handler:
+        headers = {
+            "Authorization": "Bearer context-key",
+            "Content-Length": str(len(json.dumps(payload).encode())),
+        }
+        rfile = io.BytesIO(json.dumps(payload).encode())
+
+    responses = []
+    monkeypatch.setattr(server, "_EXTERNAL_API_KEY", "context-key")
+    monkeypatch.setattr(server, "j", lambda _handler, body, status=200: responses.append((status, body)))
+    monkeypatch.setattr(server, "confirmation_context_for_request", lambda *_args, **_kwargs: None)
+
+    server._handle_external_confirmation_context(Handler())
+
+    assert responses == [(404, {"error": "not found"})]
+    serialized = repr(responses)
+    assert "user-A" not in serialized
+    assert "assignment-A" not in serialized
+    assert "context-key" not in serialized
 
 
 def test_messages_array_validated():
@@ -104,7 +228,8 @@ def test_sse_event_shapes():
     body = SRC[SRC.index("def _handle_external_chat") :]
     contract = (Path(__file__).resolve().parent.parent / "api" / "external_chat_contract.py").read_text()
     assert '"type": "session", "session_id": session_id' in body
-    assert "external_turn_events(final_response, result, session_id)" in body
+    assert "external_turn_events(" in body
+    assert "clerk_user_id=clerk_user_id" in body
     assert '"type": "delta", "content": final_response[index : index + 80]' in contract
     assert '"type": "done", "content": final_response, "session_id": session_id' in contract
     assert '"type": "error", "content": msg, "session_id": session_id' in body
@@ -114,6 +239,7 @@ def test_sse_headers_and_chunked_helper():
     body = SRC[SRC.index("def _handle_external_chat") :]
     assert "text/event-stream" in body
     assert "end_sse_headers(handler)" in body
+    assert 'send_header("Access-Control-Allow-Origin", "*")' not in body
 
 
 def test_profile_set_and_always_cleared():

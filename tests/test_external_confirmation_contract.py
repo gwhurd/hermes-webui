@@ -23,11 +23,13 @@ from api.external_chat_contract import (
 TOOL_NAME = "mcp_vault_mcp_vault_start_removal"
 PICKUP_TOOL_NAME = "mcp_vault_mcp_vault_record_removal_pickup"
 RETURN_TOOL_NAME = "mcp_vault_mcp_vault_complete_removal"
+MILEAGE_TOOL_NAME = "mcp_vault_mcp_vault_record_removal_mileage"
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 NOW_MS = 1_783_944_000_000
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-departure-confirmation-structured-content.json"
 PICKUP_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-pickup-confirmation-structured-content.json"
 RETURN_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-return-confirmation-structured-content.json"
+MILEAGE_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-mileage-confirmation-structured-content.json"
 
 
 def _candidate(n: int = 1) -> dict:
@@ -57,6 +59,8 @@ def _arguments_for(tool_name: str) -> dict:
         return {"decedentQuery": " Henderson ", "sourceCustodyAcknowledged": True, "conditionNotes": " Intact ", "accessNotes": " ", "idempotencyKey": " pickup-key "}
     if tool_name == RETURN_TOOL_NAME:
         return {"decedentQuery": " Henderson ", "destination": " Cooler Two ", "notes": " Returned intact ", "idempotencyKey": " return-key "}
+    if tool_name == MILEAGE_TOOL_NAME:
+        return {"decedentQuery": " Henderson ", "measurement": {"kind": "odometer", "startOdometer": " 100.0 ", "endOdometer": " 112.5 "}, "idempotencyKey": " original-mileage-key "}
     return {}
 
 
@@ -104,6 +108,91 @@ def test_actual_vault_mcp_return_fixture_maps_complete_removal_to_return():
     assert confirmation_card_from_current_turn(
         _turn_with_tool_result(fixture, tool_name=RETURN_TOOL_NAME), now=NOW
     ) == fixture
+
+
+def test_actual_vault_mcp_mileage_fixture_pairs_current_tool_call_and_preserves_normalized_measurement():
+    fixture = json.loads(MILEAGE_FIXTURE_PATH.read_text())
+
+    card, context = confirmation_card_and_context_from_current_turn(
+        _turn_with_tool_result(fixture, tool_name=MILEAGE_TOOL_NAME), now=NOW
+    )
+
+    assert card == fixture
+    assert context == {
+        "decedentQuery": "Henderson",
+        "measurement": {"kind": "odometer", "startOdometer": "100.0", "endOdometer": "112.5"},
+        "idempotencyKey": "original-mileage-key",
+    }
+
+    mismatched = _turn_with_tool_result(fixture, tool_name=MILEAGE_TOOL_NAME)
+    mismatched[6]["tool_call_id"] = "call-other"
+    assert confirmation_card_and_context_from_current_turn(mismatched, now=NOW) == (None, None)
+
+
+def test_mileage_browser_card_is_candidate_only_and_registry_retains_original_nested_facts():
+    clear_confirmation_context_registry_for_tests()
+    fixture = json.loads(MILEAGE_FIXTURE_PATH.read_text())
+    result = {"messages": _turn_with_tool_result(fixture, tool_name=MILEAGE_TOOL_NAME)}
+
+    events = external_turn_events(
+        "Mileage needs confirmation", result, "session-mileage", now=NOW, clerk_user_id="user-A"
+    )
+
+    assert events[1] == {
+        "type": "confirmation_card",
+        "card": fixture,
+        "session_id": "session-mileage",
+    }
+    assert all(
+        secret not in repr(events[1])
+        for secret in ("measurement", "100.0", "112.5", "original-mileage-key")
+    )
+
+    request = {
+        "clerk_user_id": "user-A",
+        "session_id": "session-mileage",
+        "command": "mileage",
+        "card_fingerprint": card_fingerprint(fixture),
+        "candidate_ids": [candidate["assignmentId"] for candidate in fixture["candidates"]],
+    }
+
+    class Session:
+        profile = "vault"
+        external_session_owner = "user-A"
+
+    expected = {
+        "decedentQuery": "Henderson",
+        "measurement": {"kind": "odometer", "startOdometer": "100.0", "endOdometer": "112.5"},
+        "idempotencyKey": "original-mileage-key",
+    }
+    first_lookup = confirmation_context_for_request(lambda _sid: Session(), request, now_ms=NOW_MS)
+    assert first_lookup == expected
+    first_lookup["measurement"]["startOdometer"] = "999.9"
+    assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=NOW_MS) == expected
+
+
+def test_mileage_context_rejects_noncanonical_measurements_bounds_and_forbidden_fields():
+    fixture = json.loads(MILEAGE_FIXTURE_PATH.read_text())
+    base = _arguments_for(MILEAGE_TOOL_NAME)
+    for measurement in (
+        {"kind": "odometer", "startOdometer": "1e2", "endOdometer": "112.5"},
+        {"kind": "odometer", "startOdometer": "113.0", "endOdometer": "112.5"},
+        {"kind": "odometer", "startOdometer": "0.0", "endOdometer": "2000000.1"},
+        {"kind": "explicit_trip", "tripMiles": "1000.1"},
+    ):
+        arguments = {**base, "measurement": measurement}
+        assert confirmation_card_and_context_from_current_turn(
+            _turn_with_tool_result(fixture, tool_name=MILEAGE_TOOL_NAME, arguments=arguments), now=NOW
+        ) == (None, None)
+
+    assert confirmation_card_and_context_from_current_turn(
+        _turn_with_tool_result(
+            fixture,
+            tool_name=MILEAGE_TOOL_NAME,
+            arguments={**base, "measurement": {**base["measurement"], "authority": "director"}},
+        ),
+        now=NOW,
+    ) == (None, None)
 
 
 def test_card_candidates_require_canonical_scalars_and_unique_assignment_ids():

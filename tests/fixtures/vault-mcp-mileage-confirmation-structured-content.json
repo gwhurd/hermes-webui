@@ -1,0 +1,17 @@
+{
+  "kind": "vault.removal_assignment_confirmation",
+  "version": 1,
+  "command": "mileage",
+  "issuedAt": 1783944000000,
+  "expiresAt": 1783944300000,
+  "candidates": [
+    {
+      "assignmentId": "assignment_henderson",
+      "decedentName": "Jane Henderson",
+      "caseNumber": "25-001",
+      "source": "St. John's Hospital",
+      "scheduledFor": "2026-07-13T10:30:00.000Z",
+      "assignedTeam": "North Team"
+    }
+  ]
+}

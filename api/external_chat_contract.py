@@ -5,9 +5,12 @@ identity and MCP output, neither of which belongs in WebUI diagnostics.
 """
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import re
 import threading
 from typing import Any
 
@@ -16,6 +19,7 @@ _VAULT_REMOVAL_TOOLS = {
     "mcp_vault_mcp_vault_start_removal": "departure",
     "mcp_vault_mcp_vault_record_removal_pickup": "pickup",
     "mcp_vault_mcp_vault_complete_removal": "return",
+    "mcp_vault_mcp_vault_record_removal_mileage": "mileage",
 }
 _CARD_KIND = "vault.removal_assignment_confirmation"
 _CARD_VERSION = 1
@@ -188,6 +192,9 @@ def _normalize_command_arguments(command: str, value: Any) -> dict | None:
     elif command == "return":
         allowed = {"decedentQuery", "confirmationAssignmentId", "destination", "notes", "idempotencyKey"}
         required = {"decedentQuery", "destination", "idempotencyKey"}
+    elif command == "mileage":
+        allowed = {"decedentQuery", "confirmationAssignmentId", "measurement", "idempotencyKey"}
+        required = {"decedentQuery", "measurement", "idempotencyKey"}
     else:
         return None
     if not required.issubset(value) or any(key not in allowed for key in value):
@@ -197,7 +204,7 @@ def _normalize_command_arguments(command: str, value: Any) -> dict | None:
     idempotency_key = _bounded_trimmed_string(value.get("idempotencyKey"), 200)
     if decedent_query is None or idempotency_key is None:
         return None
-    normalized = {"decedentQuery": decedent_query}
+    normalized: dict[str, Any] = {"decedentQuery": decedent_query}
     confirmation_id = value.get("confirmationAssignmentId")
     if confirmation_id is not None:
         confirmation_id = _bounded_trimmed_string(confirmation_id, 256)
@@ -216,7 +223,7 @@ def _normalize_command_arguments(command: str, value: Any) -> dict | None:
                     return None
                 if note.strip():
                     normalized[key] = note.strip()
-    else:
+    elif command == "return":
         destination = _bounded_trimmed_string(value.get("destination"), 200)
         if destination is None:
             return None
@@ -227,6 +234,36 @@ def _normalize_command_arguments(command: str, value: Any) -> dict | None:
                 return None
             if notes.strip():
                 normalized["notes"] = notes.strip()
+    else:
+        measurement = value.get("measurement")
+        if not isinstance(measurement, dict):
+            return None
+        kind = measurement.get("kind")
+        if kind == "odometer" and set(measurement) == {"kind", "startOdometer", "endOdometer"}:
+            fields = ("startOdometer", "endOdometer")
+            limit = Decimal("2000000.0")
+        elif kind == "explicit_trip" and set(measurement) == {"kind", "tripMiles"}:
+            fields = ("tripMiles",)
+            limit = Decimal("1000.0")
+        else:
+            return None
+        normalized_measurement = {"kind": kind}
+        for field in fields:
+            raw = measurement.get(field)
+            if not isinstance(raw, str):
+                return None
+            decimal = raw.strip()
+            if not re.fullmatch(r"(?:0|[1-9]\d*)(?:\.\d)?", decimal):
+                return None
+            try:
+                if Decimal(decimal) > limit:
+                    return None
+            except InvalidOperation:
+                return None
+            normalized_measurement[field] = decimal
+        if kind == "odometer" and Decimal(normalized_measurement["startOdometer"]) > Decimal(normalized_measurement["endOdometer"]):
+            return None
+        normalized["measurement"] = normalized_measurement
     normalized["idempotencyKey"] = idempotency_key
     return normalized
 
@@ -359,7 +396,7 @@ def confirmation_card_and_context_from_current_turn(
         now or datetime.now(timezone.utc),
         command,
     )
-    if card is None or (command in {"pickup", "return"} and command_context is None):
+    if card is None or (command in {"pickup", "return", "mileage"} and command_context is None):
         return None, None
     return card, command_context
 
@@ -395,7 +432,7 @@ def _remember_confirmation_context(
         "card_fingerprint": fingerprint,
         "candidate_ids": candidate_ids,
         "expires_at": card["expiresAt"],
-        "context": dict(context),
+        "context": copy.deepcopy(context),
     }
     with _confirmation_contexts_lock:
         for key, existing in list(_confirmation_contexts.items()):
@@ -414,7 +451,7 @@ def confirmation_context_for_request(get_session: Any, payload: Any, *, now_ms: 
     fingerprint = payload.get("card_fingerprint")
     candidate_ids = payload.get("candidate_ids")
     if (
-        owner is None or session_id is None or command not in {"pickup", "return"}
+        owner is None or session_id is None or command not in {"pickup", "return", "mileage"}
         or not isinstance(fingerprint, str) or len(fingerprint) != 64
         or any(character not in "0123456789abcdef" for character in fingerprint)
         or not isinstance(candidate_ids, list) or not candidate_ids or len(candidate_ids) > 5
@@ -433,4 +470,4 @@ def confirmation_context_for_request(get_session: Any, payload: Any, *, now_ms: 
         entry = _confirmation_contexts.get(key)
         if not entry or entry["expires_at"] <= now_ms or entry["candidate_ids"] != tuple(candidate_ids):
             return None
-        return dict(entry["context"])
+        return copy.deepcopy(entry["context"])

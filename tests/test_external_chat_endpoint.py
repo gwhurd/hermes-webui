@@ -64,35 +64,34 @@ def test_vault_requires_nonblank_actor_context_before_sse():
     assert "vault actor context is required" in validation
 
 
-def test_vault_actor_env_is_scoped_to_serialized_agent_work():
-    """Only Vault turns receive actor env, and only while CHAT_LOCK is held."""
+def test_vault_actor_metadata_is_task_local_and_scoped_to_agent_run():
+    """Vault actor identity uses the core's server-scoped ContextVar binder."""
     body = SRC[SRC.index("def _handle_external_chat") : SRC.index("class QuietHTTPServer")]
     chat_lock = body.index("with CHAT_LOCK:")
-    agent_ctor = body.index("agent = AIAgent(")
     agent_run = body.index("result = agent.run_conversation(")
-    convex_set = body.index('os.environ["CONVEX_USER_TOKEN"]')
-    vault_id_set = body.index('os.environ["VAULT_USER_ID"]')
-    assert chat_lock < convex_set < agent_ctor < agent_run
-    assert chat_lock < vault_id_set < agent_ctor < agent_run
-    assert "if vault_actor_env:" in body[:convex_set]
+    metadata_scope = body.index("metadata_scope =")
+    assert chat_lock < metadata_scope < agent_run
+    assert "with metadata_scope:" in body[metadata_scope:agent_run]
+    assert "_vault_mcp_metadata_scope(convex_token)" in body
+    assert '"vault-mcp"' in SRC
+    assert '"com.southwestcremation.vault/convex-user-token"' in SRC
 
 
-def test_vault_actor_env_is_restored_in_existing_finally():
-    """Both prior values, including absence, are restored after success or failure."""
+def test_vault_actor_env_propagation_and_restore_logic_are_removed():
+    """Vault turns must never place actor identity in process-global env vars."""
     body = SRC[SRC.index("def _handle_external_chat") : SRC.index("class QuietHTTPServer")]
-    finally_idx = body.index("finally:")
-    tail = body[finally_idx:]
-    agent_run = body.index("result = agent.run_conversation(")
-    for var in ("CONVEX_USER_TOKEN", "VAULT_USER_ID"):
-        assert f'old_{var.lower()}' in body
-        assert f'os.environ.pop("{var}", None)' in tail
-        assert f'os.environ["{var}"] = old_{var.lower()}' in tail
-        assert agent_run < body.index(f'os.environ.pop("{var}", None)')
+    assert "CONVEX_USER_TOKEN" not in body
+    assert "VAULT_USER_ID" not in body
+    assert "old_convex_user_token" not in body
+    assert "old_vault_user_id" not in body
 
 
 def test_actor_token_is_not_added_to_messages_sse_or_errors():
     """The actor token is process-only and never enters a persisted/output payload."""
     body = SRC[SRC.index("def _handle_external_chat") : SRC.index("class QuietHTTPServer")]
+    run_start = body.index("result = agent.run_conversation(")
+    run_end = body.index("\n                    )", run_start)
+    assert "convex_token" not in body[run_start:run_end]
     assert "persist_user_message=user_msg" in body
     assert "final_response = _redact_actor_token(" in body
     assert "result_messages = _redact_actor_token(" in body

@@ -10,7 +10,9 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ContextManager
 
 # Ignore SIGPIPE so a dropped client only aborts that write, not the whole WebUI process.
 _SIGPIPE = getattr(signal, "SIGPIPE", None)
@@ -132,6 +134,21 @@ def _sse_write(handler, data: dict) -> None:
     """Write one SSE data frame and flush so the client sees it immediately."""
     handler.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8"))
     handler.wfile.flush()
+
+
+def _vault_mcp_metadata_scope(convex_token: str | None) -> ContextManager[object]:
+    """Lazily bind Vault's private actor token to its MCP server for one call."""
+    if not convex_token:
+        return nullcontext()
+
+    # Hermes core owns this ContextVar-backed, server-scoped transport.  Keep the
+    # import lazy so non-Vault WebUI turns neither require nor initialize it.
+    from tools.mcp_request_metadata import mcp_request_metadata
+
+    return mcp_request_metadata(
+        "vault-mcp",
+        {"com.southwestcremation.vault/convex-user-token": convex_token},
+    )
 
 
 def _handle_external_chat(handler) -> bool:
@@ -302,87 +319,72 @@ def _handle_external_chat(handler) -> bool:
             os.environ["HERMES_EXEC_ASK"] = "1"
             os.environ["HERMES_SESSION_KEY"] = s.session_id
 
-        old_convex_user_token = None
-        old_vault_user_id = None
         try:
             from run_agent import AIAgent
             from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
 
             with CHAT_LOCK:
-                try:
-                    if vault_actor_env:
-                        with _ENV_LOCK:
-                            old_convex_user_token = os.environ.get("CONVEX_USER_TOKEN")
-                            old_vault_user_id = os.environ.get("VAULT_USER_ID")
-                            os.environ["CONVEX_USER_TOKEN"] = convex_token
-                            os.environ["VAULT_USER_ID"] = clerk_user_id
-
-                    _model, _provider, _base_url = resolve_model_provider(
+                _model, _provider, _base_url = resolve_model_provider(
                         model_with_provider_context(s.model, getattr(s, "model_provider", None))
                     )
-                    _api_key = None
-                    try:
-                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                _api_key = None
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
 
-                        _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                    _rt = resolve_runtime_provider_with_anthropic_env_lock(
                             resolve_runtime_provider,
                             requested=_provider,
                         )
-                        _api_key = _rt.get("api_key")
-                        if not _provider:
-                            _provider = _rt.get("provider")
-                        if not _base_url:
-                            _base_url = _rt.get("base_url")
-                    except Exception as _e:
-                        if vault_actor_env:
-                            print("[external-chat] WARNING: resolve_runtime_provider failed", flush=True)
-                        else:
-                            print(f"[external-chat] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
-                    if isinstance(_provider, str) and _provider.startswith("custom:"):
-                        _cp_key, _cp_base = resolve_custom_provider_connection(_provider)
-                        if not _api_key and _cp_key:
-                            _api_key = _cp_key
-                        if not _base_url and _cp_base:
-                            _base_url = _cp_base
+                    _api_key = _rt.get("api_key")
+                    if not _provider:
+                        _provider = _rt.get("provider")
+                    if not _base_url:
+                        _base_url = _rt.get("base_url")
+                except Exception as _e:
+                    if vault_actor_env:
+                        print("[external-chat] WARNING: resolve_runtime_provider failed", flush=True)
+                    else:
+                        print(f"[external-chat] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
+                if isinstance(_provider, str) and _provider.startswith("custom:"):
+                    _cp_key, _cp_base = resolve_custom_provider_connection(_provider)
+                    if not _api_key and _cp_key:
+                        _api_key = _cp_key
+                    if not _base_url and _cp_base:
+                        _base_url = _cp_base
 
-                    agent = AIAgent(
-                        model=_model,
-                        provider=_provider,
-                        base_url=_base_url,
-                        api_key=_api_key,
-                        platform="webui",
-                        quiet_mode=True,
-                        enabled_toolsets=_resolve_cli_toolsets(),
-                        session_id=s.session_id,
-                    )
+                agent = AIAgent(
+                    model=_model,
+                    provider=_provider,
+                    base_url=_base_url,
+                    api_key=_api_key,
+                    platform="webui",
+                    quiet_mode=True,
+                    enabled_toolsets=_resolve_cli_toolsets(),
+                    session_id=s.session_id,
+                )
 
-                    # Build conversation history from incoming messages (excluding
-                    # the last user message which is sent as user_message)
-                    conversation_history = []
-                    for m in messages[:-1]:
-                        if isinstance(m, dict):
-                            conversation_history.append({
-                                "role": m.get("role", "user"),
-                                "content": str(m.get("content", "")),
-                            })
+                # Build conversation history from incoming messages (excluding
+                # the last user message which is sent as user_message).
+                conversation_history = []
+                for m in messages[:-1]:
+                    if isinstance(m, dict):
+                        conversation_history.append({
+                            "role": m.get("role", "user"),
+                            "content": str(m.get("content", "")),
+                        })
 
+                metadata_scope = (
+                    _vault_mcp_metadata_scope(convex_token)
+                    if vault_actor_env
+                    else nullcontext()
+                )
+                with metadata_scope:
                     result = agent.run_conversation(
                         user_message=user_msg,
                         conversation_history=conversation_history,
                         task_id=s.session_id,
                         persist_user_message=user_msg,
                     )
-                finally:
-                    if vault_actor_env:
-                        with _ENV_LOCK:
-                            if old_convex_user_token is None:
-                                os.environ.pop("CONVEX_USER_TOKEN", None)
-                            else:
-                                os.environ["CONVEX_USER_TOKEN"] = old_convex_user_token
-                            if old_vault_user_id is None:
-                                os.environ.pop("VAULT_USER_ID", None)
-                            else:
-                                os.environ["VAULT_USER_ID"] = old_vault_user_id
         finally:
             with _ENV_LOCK:
                 if old_cwd is None:

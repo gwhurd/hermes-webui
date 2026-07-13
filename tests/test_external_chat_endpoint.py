@@ -102,9 +102,11 @@ def test_actor_token_is_not_added_to_messages_sse_or_errors():
 
 def test_sse_event_shapes():
     body = SRC[SRC.index("def _handle_external_chat") :]
+    contract = (Path(__file__).resolve().parent.parent / "api" / "external_chat_contract.py").read_text()
     assert '"type": "session", "session_id": session_id' in body
-    assert '{"type": "delta", "content": chunk}' in body
-    assert '"type": "done", "content": final_response, "session_id": session_id' in body
+    assert "external_turn_events(final_response, result, session_id)" in body
+    assert '"type": "delta", "content": final_response[index : index + 80]' in contract
+    assert '"type": "done", "content": final_response, "session_id": session_id' in contract
     assert '"type": "error", "content": msg, "session_id": session_id' in body
 
 
@@ -124,10 +126,12 @@ def test_profile_set_and_always_cleared():
 
 def test_session_resume_or_create():
     body = SRC[SRC.index("def _handle_external_chat") :]
-    assert "get_session(session_id)" in body
-    assert "new_session(profile=requested_profile)" in body
+    assert "resolve_external_session(" in body
+    contract = (Path(__file__).resolve().parent.parent / "api" / "external_chat_contract.py").read_text()
+    assert "get_session(session_id)" in contract
+    assert "new_session(profile=requested_profile)" in contract
     # unknown session_id falls back to a fresh session instead of 500
-    assert "except (KeyError, FileNotFoundError):" in body
+    assert "except (KeyError, FileNotFoundError):" in contract
 
 
 def test_conversation_history_forwarded():

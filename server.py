@@ -112,6 +112,10 @@ from api.helpers import (
     _CLIENT_DISCONNECT_ERRORS,
 )
 from api.profiles import set_request_profile, clear_request_profile
+from api.external_chat_contract import (
+    external_turn_events,
+    resolve_external_session,
+)
 from api.routes import handle_delete, handle_get, handle_patch, handle_post, handle_put, apply_cors_preflight_headers
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
@@ -237,15 +241,15 @@ def _handle_external_chat(handler) -> bool:
     try:
         from api.models import get_session, new_session
 
-        if session_id:
-            try:
-                s = get_session(session_id)
-            except (KeyError, FileNotFoundError):
-                s = new_session(profile=requested_profile)
-                session_id = s.session_id
-        else:
-            s = new_session(profile=requested_profile)
-            session_id = s.session_id
+        s, session_id = resolve_external_session(
+            get_session,
+            new_session,
+            session_id,
+            requested_profile,
+            clerk_user_id,
+        )
+    except PermissionError:
+        return j(handler, {"error": "forbidden"}, status=403)
     except Exception as exc:
         logger.error("[external-chat] session setup failed: %s", exc, exc_info=True)
         return j(handler, {"error": "session setup failed"}, status=500)
@@ -403,14 +407,9 @@ def _handle_external_chat(handler) -> bool:
         final_response = _redact_actor_token(result.get("final_response") or "")
 
         # 9. Stream the response as SSE
-        # Send the full response as a single delta (synchronous run), then done.
-        # Chunking it into smaller pieces gives a streaming feel.
-        _CHUNK_SIZE = 80  # characters per delta event
-        for i in range(0, len(final_response), _CHUNK_SIZE):
-            chunk = final_response[i : i + _CHUNK_SIZE]
-            _sse_write(handler, {"type": "delta", "content": chunk})
-
-        _sse_write(handler, {"type": "done", "content": final_response, "session_id": session_id})
+        # Build delta/card/done events after the synchronous agent run.
+        for event in external_turn_events(final_response, result, session_id):
+            _sse_write(handler, event)
 
         # 10. Persist session state (matching _handle_chat_sync)
         with _get_session_agent_lock(s.session_id):

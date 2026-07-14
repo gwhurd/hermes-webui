@@ -1,0 +1,23 @@
+{
+  "kind": "vault.custody_movement_confirmation",
+  "version": 1,
+  "command": "custody",
+  "issuedAt": 1783944000000,
+  "expiresAt": 1783944300000,
+  "caseCandidates": [
+    {
+      "caseId": "case_henderson",
+      "decedentName": "Jane Henderson",
+      "caseNumber": "25-001"
+    }
+  ],
+  "locationCandidates": [
+    {
+      "locationId": "location_moon_city",
+      "canonicalName": "Moon City Mortuary",
+      "kind": "crematory",
+      "isRestricted": true,
+      "requiresCompletedHandoffConfirmation": true
+    }
+  ]
+}

@@ -20,6 +20,7 @@ _VAULT_REMOVAL_TOOLS = {
     "mcp_vault_mcp_vault_record_removal_pickup": "pickup",
     "mcp_vault_mcp_vault_complete_removal": "return",
     "mcp_vault_mcp_vault_record_removal_mileage": "mileage",
+    "mcp_vault_mcp_vault_record_custody_movement": "custody",
 }
 _CARD_KIND = "vault.removal_assignment_confirmation"
 _CARD_VERSION = 1
@@ -31,6 +32,24 @@ _CARD_LIFETIME_MS = 300_000
 _MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _CONTEXT_REQUEST_KEYS = frozenset({
     "clerk_user_id", "session_id", "command", "card_fingerprint", "candidate_ids",
+})
+_CUSTODY_CONTEXT_REQUEST_KEYS = frozenset({
+    "clerk_user_id", "session_id", "command", "card_fingerprint",
+    "case_candidate_ids", "location_candidate_ids",
+})
+_CUSTODY_CARD_KIND = "vault.custody_movement_confirmation"
+_CUSTODY_CARD_KEYS = frozenset({
+    "kind", "version", "command", "issuedAt", "expiresAt",
+    "caseCandidates", "locationCandidates",
+})
+_CUSTODY_CASE_CANDIDATE_KEYS = frozenset({"caseId", "decedentName", "caseNumber"})
+_CUSTODY_LOCATION_CANDIDATE_KEYS = frozenset({
+    "locationId", "canonicalName", "kind", "isRestricted",
+    "requiresCompletedHandoffConfirmation",
+})
+_CUSTODY_LOCATION_KINDS = frozenset({
+    "internal_cooler", "external_custodian", "crematory", "cemetery",
+    "preparation", "chapel", "other",
 })
 _confirmation_contexts: dict[tuple[str, str, str, str], dict] = {}
 _confirmation_contexts_lock = threading.Lock()
@@ -195,6 +214,12 @@ def _normalize_command_arguments(command: str, value: Any) -> dict | None:
     elif command == "mileage":
         allowed = {"decedentQuery", "confirmationAssignmentId", "measurement", "idempotencyKey"}
         required = {"decedentQuery", "measurement", "idempotencyKey"}
+    elif command == "custody":
+        allowed = {
+            "decedentQuery", "confirmationCaseId", "destinationQuery",
+            "confirmationLocationId", "custodyHandoffCompleted", "notes", "idempotencyKey",
+        }
+        required = {"decedentQuery", "destinationQuery", "custodyHandoffCompleted", "idempotencyKey"}
     else:
         return None
     if not required.issubset(value) or any(key not in allowed for key in value):
@@ -234,7 +259,7 @@ def _normalize_command_arguments(command: str, value: Any) -> dict | None:
                 return None
             if notes.strip():
                 normalized["notes"] = notes.strip()
-    else:
+    elif command == "mileage":
         measurement = value.get("measurement")
         if not isinstance(measurement, dict):
             return None
@@ -264,6 +289,24 @@ def _normalize_command_arguments(command: str, value: Any) -> dict | None:
         if kind == "odometer" and Decimal(normalized_measurement["startOdometer"]) > Decimal(normalized_measurement["endOdometer"]):
             return None
         normalized["measurement"] = normalized_measurement
+    else:
+        destination_query = _bounded_trimmed_string(value.get("destinationQuery"), 256)
+        if destination_query is None or value.get("custodyHandoffCompleted") is not True:
+            return None
+        normalized["destinationQuery"] = destination_query
+        for key in ("confirmationCaseId", "confirmationLocationId"):
+            confirmation_id = value.get(key)
+            if confirmation_id is not None:
+                confirmation_id = _bounded_trimmed_string(confirmation_id, 256)
+                if confirmation_id is None:
+                    return None
+                normalized[key] = confirmation_id
+        notes = value.get("notes")
+        if notes is not None:
+            if not isinstance(notes, str) or not notes.strip() or len(notes.strip()) > 1000:
+                return None
+            normalized["notes"] = notes.strip()
+        normalized["custodyHandoffCompleted"] = True
     normalized["idempotencyKey"] = idempotency_key
     return normalized
 
@@ -280,6 +323,8 @@ def _tool_call_arguments(call: dict, command: str) -> dict | None:
 
 
 def _approved_card(payload: Any, now: datetime, command: str) -> dict | None:
+    if command == "custody":
+        return _approved_custody_card(payload, now)
     if not isinstance(payload, dict) or set(payload) != _CARD_KEYS:
         return None
     if (
@@ -341,6 +386,59 @@ def _approved_card(payload: Any, now: datetime, command: str) -> dict | None:
     }
 
 
+def _approved_custody_card(payload: Any, now: datetime) -> dict | None:
+    if not isinstance(payload, dict) or set(payload) != _CUSTODY_CARD_KEYS:
+        return None
+    if (
+        payload.get("kind") != _CUSTODY_CARD_KIND
+        or type(payload.get("version")) is not int
+        or payload.get("version") != _CARD_VERSION
+        or payload.get("command") != "custody"
+    ):
+        return None
+    issued_at = _safe_unix_milliseconds(payload.get("issuedAt"))
+    expires_at = _safe_unix_milliseconds(payload.get("expiresAt"))
+    now_ms = _unix_milliseconds(now)
+    if (
+        issued_at is None or expires_at is None or issued_at > now_ms
+        or expires_at <= now_ms or expires_at <= issued_at
+        or expires_at - issued_at > _CARD_LIFETIME_MS
+    ):
+        return None
+
+    def normalize_candidates(candidates: Any, keys: frozenset[str], id_key: str) -> list[dict] | None:
+        if not isinstance(candidates, list) or not candidates or len(candidates) > 5:
+            return None
+        normalized, identifiers = [], set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or set(candidate) != keys:
+                return None
+            identifier = candidate.get(id_key)
+            if _bounded_trimmed_string(identifier, 256) != identifier or identifier in identifiers:
+                return None
+            for key, value in candidate.items():
+                if key in {"isRestricted", "requiresCompletedHandoffConfirmation"}:
+                    if type(value) is not bool:
+                        return None
+                elif _bounded_trimmed_string(value, 256) != value:
+                    return None
+            if id_key == "locationId" and candidate["kind"] not in _CUSTODY_LOCATION_KINDS:
+                return None
+            identifiers.add(identifier)
+            normalized.append({key: candidate[key] for key in candidate})
+        return normalized
+
+    case_candidates = normalize_candidates(payload.get("caseCandidates"), _CUSTODY_CASE_CANDIDATE_KEYS, "caseId")
+    location_candidates = normalize_candidates(payload.get("locationCandidates"), _CUSTODY_LOCATION_CANDIDATE_KEYS, "locationId")
+    if case_candidates is None or location_candidates is None:
+        return None
+    return {
+        "kind": _CUSTODY_CARD_KIND, "version": _CARD_VERSION, "command": "custody",
+        "issuedAt": payload["issuedAt"], "expiresAt": payload["expiresAt"],
+        "caseCandidates": case_candidates, "locationCandidates": location_candidates,
+    }
+
+
 def confirmation_card_and_context_from_current_turn(
     messages: Any, *, now: datetime | None = None
 ) -> tuple[dict | None, dict | None]:
@@ -396,7 +494,7 @@ def confirmation_card_and_context_from_current_turn(
         now or datetime.now(timezone.utc),
         command,
     )
-    if card is None or (command in {"pickup", "return", "mileage"} and command_context is None):
+    if card is None or (command in {"pickup", "return", "mileage", "custody"} and command_context is None):
         return None, None
     return card, command_context
 
@@ -420,20 +518,33 @@ def _remember_confirmation_context(
 ) -> None:
     if card["expiresAt"] <= now_ms:
         return
-    candidate_ids = tuple(candidate["assignmentId"] for candidate in card["candidates"])
-    confirmation_id = context.get("confirmationAssignmentId")
-    if confirmation_id is not None and confirmation_id not in candidate_ids:
-        return
+    if card["command"] == "custody":
+        case_candidate_ids = tuple(candidate["caseId"] for candidate in card["caseCandidates"])
+        location_candidate_ids = tuple(candidate["locationId"] for candidate in card["locationCandidates"])
+        if (
+            context.get("confirmationCaseId") not in {None, *case_candidate_ids}
+            or context.get("confirmationLocationId") not in {None, *location_candidate_ids}
+        ):
+            return
+    else:
+        candidate_ids = tuple(candidate["assignmentId"] for candidate in card["candidates"])
+        confirmation_id = context.get("confirmationAssignmentId")
+        if confirmation_id is not None and confirmation_id not in candidate_ids:
+            return
     fingerprint = card_fingerprint(card)
     entry = {
         "clerk_user_id": clerk_user_id,
         "session_id": session_id,
         "command": card["command"],
         "card_fingerprint": fingerprint,
-        "candidate_ids": candidate_ids,
         "expires_at": card["expiresAt"],
         "context": copy.deepcopy(context),
     }
+    if card["command"] == "custody":
+        entry["case_candidate_ids"] = case_candidate_ids
+        entry["location_candidate_ids"] = location_candidate_ids
+    else:
+        entry["candidate_ids"] = candidate_ids
     with _confirmation_contexts_lock:
         for key, existing in list(_confirmation_contexts.items()):
             if existing["expires_at"] <= now_ms:
@@ -443,22 +554,31 @@ def _remember_confirmation_context(
 
 def confirmation_context_for_request(get_session: Any, payload: Any, *, now_ms: int) -> dict | None:
     """Return only normalized command facts after exact durable and ephemeral binding checks."""
-    if not isinstance(payload, dict) or set(payload) != _CONTEXT_REQUEST_KEYS:
+    if not isinstance(payload, dict):
         return None
     owner = _bounded_trimmed_string(payload.get("clerk_user_id"), 256)
     session_id = _bounded_trimmed_string(payload.get("session_id"), 256)
     command = payload.get("command")
     fingerprint = payload.get("card_fingerprint")
-    candidate_ids = payload.get("candidate_ids")
     if (
-        owner is None or session_id is None or command not in {"pickup", "return", "mileage"}
+        owner is None or session_id is None or command not in {"pickup", "return", "mileage", "custody"}
         or not isinstance(fingerprint, str) or len(fingerprint) != 64
         or any(character not in "0123456789abcdef" for character in fingerprint)
-        or not isinstance(candidate_ids, list) or not candidate_ids or len(candidate_ids) > 5
-        or any(_bounded_trimmed_string(value, 256) != value for value in candidate_ids)
-        or len(set(candidate_ids)) != len(candidate_ids)
     ):
         return None
+    if command == "custody":
+        case_candidate_ids = payload.get("case_candidate_ids")
+        location_candidate_ids = payload.get("location_candidate_ids")
+        if (
+            set(payload) != _CUSTODY_CONTEXT_REQUEST_KEYS
+            or not _valid_candidate_id_list(case_candidate_ids)
+            or not _valid_candidate_id_list(location_candidate_ids)
+        ):
+            return None
+    else:
+        candidate_ids = payload.get("candidate_ids")
+        if set(payload) != _CONTEXT_REQUEST_KEYS or not _valid_candidate_id_list(candidate_ids):
+            return None
     try:
         session = get_session(session_id)
     except (KeyError, FileNotFoundError, ValueError):
@@ -468,6 +588,22 @@ def confirmation_context_for_request(get_session: Any, payload: Any, *, now_ms: 
     key = (owner, session_id, command, fingerprint)
     with _confirmation_contexts_lock:
         entry = _confirmation_contexts.get(key)
-        if not entry or entry["expires_at"] <= now_ms or entry["candidate_ids"] != tuple(candidate_ids):
+        if not entry or entry["expires_at"] <= now_ms:
+            return None
+        if command == "custody":
+            if (
+                entry["case_candidate_ids"] != tuple(case_candidate_ids)
+                or entry["location_candidate_ids"] != tuple(location_candidate_ids)
+            ):
+                return None
+        elif entry["candidate_ids"] != tuple(candidate_ids):
             return None
         return copy.deepcopy(entry["context"])
+
+
+def _valid_candidate_id_list(value: Any) -> bool:
+    return (
+        isinstance(value, list) and bool(value) and len(value) <= 5
+        and all(_bounded_trimmed_string(item, 256) == item for item in value)
+        and len(set(value)) == len(value)
+    )

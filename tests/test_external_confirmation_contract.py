@@ -25,6 +25,8 @@ PICKUP_TOOL_NAME = "mcp_vault_mcp_vault_record_removal_pickup"
 RETURN_TOOL_NAME = "mcp_vault_mcp_vault_complete_removal"
 MILEAGE_TOOL_NAME = "mcp_vault_mcp_vault_record_removal_mileage"
 CUSTODY_TOOL_NAME = "mcp_vault_mcp_vault_record_custody_movement"
+CORRECTION_TOOL_NAME = "mcp_vault_mcp_vault_correct_custody_location"
+RECEIPT_TOOL_NAME = "mcp_vault_mcp_vault_confirm_custody_receipt"
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 NOW_MS = 1_783_944_000_000
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-departure-confirmation-structured-content.json"
@@ -33,6 +35,8 @@ RETURN_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-return-con
 MILEAGE_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-mileage-confirmation-structured-content.json"
 CUSTODY_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-custody-confirmation-structured-content.json"
 CUSTODY_PRODUCER_FIXTURE_PATH = Path("/Users/paulbearer/projects/vault-mcp/test/fixtures/vault-mcp-custody-confirmation-structured-content.json")
+CORRECTION_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-custody-correction-confirmation-structured-content.json"
+RECEIPT_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-custody-receipt-confirmation-structured-content.json"
 
 
 def _candidate(n: int = 1) -> dict:
@@ -58,6 +62,18 @@ def _approved_payload(*, candidates=None, issued_at=None, expires_at=None) -> di
 
 
 def _arguments_for(tool_name: str) -> dict:
+    if tool_name == CORRECTION_TOOL_NAME:
+        return {
+            "caseId": " case_henderson ", "priorLogId": " log_henderson_latest ",
+            "correctedLocationId": " location_cooler_two ", "reason": " Correct intake location ",
+            "effectiveAt": NOW_MS - 30_000, "idempotencyKey": " correction-key ",
+        }
+    if tool_name == RECEIPT_TOOL_NAME:
+        return {
+            "caseId": " case_henderson ", "logId": " log_henderson_latest ",
+            "confirmationLocationId": " location_cooler_two ",
+            "custodyHandoffCompleted": True, "idempotencyKey": " handoff-key ",
+        }
     if tool_name == CUSTODY_TOOL_NAME:
         return {
             "decedentQuery": " Henderson ",
@@ -99,6 +115,116 @@ def _turn_with_tool_result(payload, *, tool_name=TOOL_NAME, call_id="call-curren
         {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": json.dumps({"structuredContent": payload})},
         {"role": "assistant", "content": "Assistant prose and JSON are not authority."},
     ]
+
+
+def _mutation_request(command: str, fixture: dict) -> dict:
+    location_key = "correctedLocationId" if command == "custody_correction" else "confirmationLocationId"
+    return {
+        "clerk_user_id": "user-A", "session_id": f"session-{command}", "command": command,
+        "card_fingerprint": card_fingerprint(fixture),
+        "case_candidate_ids": [candidate["caseId"] for candidate in fixture["caseCandidates"]],
+        "location_candidate_ids": [candidate[location_key] for candidate in fixture["locationCandidates"]],
+    }
+
+
+def test_custody_correction_and_receipt_documented_fixtures_are_strict_current_turn_wire_shapes():
+    # vault-mcp does not yet produce these envelopes; these documented fixtures
+    # freeze the exact adapter contract until the manager lands producer parity.
+    for command, tool_name, path in (
+        ("custody_correction", CORRECTION_TOOL_NAME, CORRECTION_FIXTURE_PATH),
+        ("custody_receipt", RECEIPT_TOOL_NAME, RECEIPT_FIXTURE_PATH),
+    ):
+        fixture = json.loads(path.read_text())
+        card, context = confirmation_card_and_context_from_current_turn(
+            _turn_with_tool_result(fixture, tool_name=tool_name), now=NOW
+        )
+        assert card == fixture
+        assert context == (
+            {
+                "caseId": "case_henderson", "priorLogId": "log_henderson_latest",
+                "correctedLocationId": "location_cooler_two", "reason": "Correct intake location",
+                "effectiveAt": NOW_MS - 30_000, "idempotencyKey": "correction-key",
+            }
+            if command == "custody_correction" else {
+                "caseId": "case_henderson", "logId": "log_henderson_latest",
+                "confirmationLocationId": "location_cooler_two", "custodyHandoffCompleted": True,
+                "idempotencyKey": "handoff-key",
+            }
+        )
+        assert all(forbidden not in repr(context) for forbidden in (
+            "organization", "actor", "role", "capability", "priorState", "receipt", "timestamp",
+        ))
+
+
+def test_custody_correction_and_receipt_bind_exact_candidate_sets_user_session_and_context():
+    class Session:
+        profile = "vault"
+        external_session_owner = "user-A"
+
+    for command, tool_name, path in (
+        ("custody_correction", CORRECTION_TOOL_NAME, CORRECTION_FIXTURE_PATH),
+        ("custody_receipt", RECEIPT_TOOL_NAME, RECEIPT_FIXTURE_PATH),
+    ):
+        clear_confirmation_context_registry_for_tests()
+        fixture = json.loads(path.read_text())
+        events = external_turn_events(
+            "Confirmation required", {"messages": _turn_with_tool_result(fixture, tool_name=tool_name)},
+            f"session-{command}", now=NOW, clerk_user_id="user-A",
+        )
+        assert events[1] == {"type": "confirmation_card", "card": fixture, "session_id": f"session-{command}"}
+        request = _mutation_request(command, fixture)
+        expected = confirmation_card_and_context_from_current_turn(
+            _turn_with_tool_result(fixture, tool_name=tool_name), now=NOW
+        )[1]
+        assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=NOW_MS) == expected
+        for altered in (
+            {**request, "clerk_user_id": "user-B"}, {**request, "session_id": "other"},
+            {**request, "card_fingerprint": "0" * 64},
+            {**request, "case_candidate_ids": ["case-other"]},
+            {**request, "location_candidate_ids": ["location-other"]}, {**request, "extra": True},
+        ):
+            assert confirmation_context_for_request(lambda _sid: Session(), altered, now_ms=NOW_MS) is None
+        assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=fixture["expiresAt"]) is None
+        clear_confirmation_context_registry_for_tests()
+        assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=NOW_MS) is None
+
+
+def test_custody_correction_and_receipt_fail_closed_for_ambiguous_malformed_unknown_or_out_of_set_cards():
+    for command, tool_name, path in (
+        ("custody_correction", CORRECTION_TOOL_NAME, CORRECTION_FIXTURE_PATH),
+        ("custody_receipt", RECEIPT_TOOL_NAME, RECEIPT_FIXTURE_PATH),
+    ):
+        fixture = json.loads(path.read_text())
+        ambiguous = {
+            **fixture,
+            "caseCandidates": [fixture["caseCandidates"][0], {**fixture["caseCandidates"][0], "caseId": "case-other", "priorLogId" if command == "custody_correction" else "logId": "log-other"}],
+            "locationCandidates": [fixture["locationCandidates"][0], {**fixture["locationCandidates"][0], "correctedLocationId" if command == "custody_correction" else "confirmationLocationId": "location-other"}],
+        }
+        assert confirmation_card_and_context_from_current_turn(_turn_with_tool_result(ambiguous, tool_name=tool_name), now=NOW)[0] == ambiguous
+        invalid = (
+            {**fixture, "kind": "vault.unknown_confirmation"},
+            {**fixture, "expiresAt": NOW_MS + 300_001},
+            {**fixture, "caseCandidates": []},
+            {**fixture, "locationCandidates": [{**fixture["locationCandidates"][0], "actor": "forbidden"}]},
+        )
+        for payload in invalid:
+            assert confirmation_card_and_context_from_current_turn(_turn_with_tool_result(payload, tool_name=tool_name), now=NOW) == (None, None)
+        # The browser context request has no idempotency field: the original
+        # current-turn key remains server-held and cannot be substituted.
+        request = _mutation_request(command, fixture)
+        assert "idempotencyKey" not in request
+        out_of_set = {**_arguments_for(tool_name), "caseId": "case-other"}
+        clear_confirmation_context_registry_for_tests()
+        events = external_turn_events("x", {"messages": _turn_with_tool_result(fixture, tool_name=tool_name, arguments=out_of_set)}, "out", now=NOW, clerk_user_id="user-A")
+        assert all(event["type"] != "confirmation_card" for event in events)
+
+
+def test_custody_mutation_cards_reject_wrong_tool_pair_and_non_allowlisted_mutation_fields():
+    for tool_name, path in ((CORRECTION_TOOL_NAME, CORRECTION_FIXTURE_PATH), (RECEIPT_TOOL_NAME, RECEIPT_FIXTURE_PATH)):
+        fixture = json.loads(path.read_text())
+        bad_args = {**_arguments_for(tool_name), "organizationId": "forbidden"}
+        assert confirmation_card_and_context_from_current_turn(_turn_with_tool_result(fixture, tool_name=tool_name, arguments=bad_args), now=NOW) == (None, None)
+        assert confirmation_card_and_context_from_current_turn(_turn_with_tool_result(fixture, tool_name=CUSTODY_TOOL_NAME), now=NOW) == (None, None)
 
 
 def test_actual_vault_mcp_structured_content_fixture_is_the_accepted_wire_shape():

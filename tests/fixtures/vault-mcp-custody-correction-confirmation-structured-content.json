@@ -1,0 +1,27 @@
+{
+  "kind": "vault.custody_correction_confirmation",
+  "version": 1,
+  "command": "custody_correction",
+  "issuedAt": 1783944000000,
+  "expiresAt": 1783944300000,
+  "caseCandidates": [
+    {
+      "caseId": "case_henderson",
+      "priorLogId": "log_henderson_latest",
+      "decedentName": "Jane Henderson",
+      "caseNumber": "25-001",
+      "currentLocationId": "location_cooler_one",
+      "currentLocationName": "Cooler One",
+      "latestMovementAt": "2026-07-13T11:30:00Z"
+    }
+  ],
+  "locationCandidates": [
+    {
+      "correctedLocationId": "location_cooler_two",
+      "canonicalName": "Cooler Two",
+      "kind": "internal_cooler",
+      "isRestricted": false,
+      "requiresCompletedHandoffConfirmation": false
+    }
+  ]
+}

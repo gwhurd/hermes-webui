@@ -300,7 +300,8 @@ def _normalize_command_arguments(command: str, value: Any) -> dict | None:
                 confirmation_id = _bounded_trimmed_string(confirmation_id, 256)
                 if confirmation_id is None:
                     return None
-                normalized[key] = confirmation_id
+                # Compatibility-only model fields: a confirmation card must not
+                # retain or use either selection to narrow its server-held sets.
         notes = value.get("notes")
         if notes is not None:
             if not isinstance(notes, str) or not notes.strip() or len(notes.strip()) > 1000:
@@ -521,11 +522,6 @@ def _remember_confirmation_context(
     if card["command"] == "custody":
         case_candidate_ids = tuple(candidate["caseId"] for candidate in card["caseCandidates"])
         location_candidate_ids = tuple(candidate["locationId"] for candidate in card["locationCandidates"])
-        if (
-            context.get("confirmationCaseId") not in {None, *case_candidate_ids}
-            or context.get("confirmationLocationId") not in {None, *location_candidate_ids}
-        ):
-            return
     else:
         candidate_ids = tuple(candidate["assignmentId"] for candidate in card["candidates"])
         confirmation_id = context.get("confirmationAssignmentId")

@@ -118,9 +118,7 @@ def test_custody_fixture_is_byte_identical_and_current_turn_pair_retains_only_no
     assert card == fixture
     assert context == {
         "decedentQuery": "Henderson",
-        "confirmationCaseId": "case_henderson",
         "destinationQuery": "Moon City Mortuary",
-        "confirmationLocationId": "location_moon_city",
         "custodyHandoffCompleted": True,
         "notes": "Completed at receiving location",
         "idempotencyKey": "custody-key",
@@ -156,8 +154,7 @@ def test_custody_event_is_candidate_only_and_context_requires_exact_dual_set_bin
         external_session_owner = "user-A"
 
     expected = {
-        "decedentQuery": "raw-query-token", "confirmationCaseId": "case_henderson",
-        "destinationQuery": "Moon City Mortuary", "confirmationLocationId": "location_moon_city",
+        "decedentQuery": "raw-query-token", "destinationQuery": "Moon City Mortuary",
         "custodyHandoffCompleted": True, "notes": "Completed at receiving location", "idempotencyKey": "custody-key",
     }
     assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=NOW_MS) == expected
@@ -175,11 +172,20 @@ def test_custody_event_is_candidate_only_and_context_requires_exact_dual_set_bin
 
 def test_custody_rejects_malformed_cards_arguments_and_mismatched_pairs():
     fixture = json.loads(CUSTODY_FIXTURE_PATH.read_text())
+    location_candidate = fixture["locationCandidates"][0]
     invalid_cards = (
         {**fixture, "caseCandidates": []},
-        {**fixture, "locationCandidates": [{**fixture["locationCandidates"][0], "kind": "unknown"}]},
-        {**fixture, "locationCandidates": [{**fixture["locationCandidates"][0], "isRestricted": 1}]},
+        {**fixture, "locationCandidates": [{**location_candidate, "kind": "unknown"}]},
+        {**fixture, "locationCandidates": [{**location_candidate, "isRestricted": 1}]},
         {**fixture, "caseCandidates": [fixture["caseCandidates"][0], fixture["caseCandidates"][0]]},
+        {**fixture, "locationCandidates": [location_candidate, location_candidate]},
+        {
+            **fixture,
+            "locationCandidates": [
+                {**location_candidate, "locationId": f"location-{index}"} for index in range(6)
+            ],
+        },
+        {**fixture, "locationCandidates": [{**location_candidate, "extra": "forbidden"}]},
         {**fixture, "actor": "forbidden"},
         {**fixture, "expiresAt": NOW_MS + 300_001},
     )

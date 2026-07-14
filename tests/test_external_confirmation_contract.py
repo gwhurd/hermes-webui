@@ -24,12 +24,15 @@ TOOL_NAME = "mcp_vault_mcp_vault_start_removal"
 PICKUP_TOOL_NAME = "mcp_vault_mcp_vault_record_removal_pickup"
 RETURN_TOOL_NAME = "mcp_vault_mcp_vault_complete_removal"
 MILEAGE_TOOL_NAME = "mcp_vault_mcp_vault_record_removal_mileage"
+CUSTODY_TOOL_NAME = "mcp_vault_mcp_vault_record_custody_movement"
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 NOW_MS = 1_783_944_000_000
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-departure-confirmation-structured-content.json"
 PICKUP_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-pickup-confirmation-structured-content.json"
 RETURN_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-return-confirmation-structured-content.json"
 MILEAGE_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-mileage-confirmation-structured-content.json"
+CUSTODY_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "vault-mcp-custody-confirmation-structured-content.json"
+CUSTODY_PRODUCER_FIXTURE_PATH = Path("/Users/paulbearer/projects/vault-mcp/test/fixtures/vault-mcp-custody-confirmation-structured-content.json")
 
 
 def _candidate(n: int = 1) -> dict:
@@ -55,6 +58,16 @@ def _approved_payload(*, candidates=None, issued_at=None, expires_at=None) -> di
 
 
 def _arguments_for(tool_name: str) -> dict:
+    if tool_name == CUSTODY_TOOL_NAME:
+        return {
+            "decedentQuery": " Henderson ",
+            "confirmationCaseId": " case_henderson ",
+            "destinationQuery": " Moon City Mortuary ",
+            "confirmationLocationId": " location_moon_city ",
+            "custodyHandoffCompleted": True,
+            "notes": " Completed at receiving location ",
+            "idempotencyKey": " custody-key ",
+        }
     if tool_name == PICKUP_TOOL_NAME:
         return {"decedentQuery": " Henderson ", "sourceCustodyAcknowledged": True, "conditionNotes": " Intact ", "accessNotes": " ", "idempotencyKey": " pickup-key "}
     if tool_name == RETURN_TOOL_NAME:
@@ -92,6 +105,107 @@ def test_actual_vault_mcp_structured_content_fixture_is_the_accepted_wire_shape(
     fixture = json.loads(FIXTURE_PATH.read_text())
 
     assert confirmation_card_from_current_turn(_turn_with_tool_result(fixture), now=NOW) == fixture
+
+
+def test_custody_fixture_is_byte_identical_and_current_turn_pair_retains_only_normalized_context():
+    assert CUSTODY_FIXTURE_PATH.read_bytes() == CUSTODY_PRODUCER_FIXTURE_PATH.read_bytes()
+    fixture = json.loads(CUSTODY_FIXTURE_PATH.read_text())
+
+    card, context = confirmation_card_and_context_from_current_turn(
+        _turn_with_tool_result(fixture, tool_name=CUSTODY_TOOL_NAME), now=NOW
+    )
+
+    assert card == fixture
+    assert context == {
+        "decedentQuery": "Henderson",
+        "destinationQuery": "Moon City Mortuary",
+        "custodyHandoffCompleted": True,
+        "notes": "Completed at receiving location",
+        "idempotencyKey": "custody-key",
+    }
+
+
+def test_custody_event_is_candidate_only_and_context_requires_exact_dual_set_binding():
+    clear_confirmation_context_registry_for_tests()
+    fixture = json.loads(CUSTODY_FIXTURE_PATH.read_text())
+    events = external_turn_events(
+        "Custody needs confirmation",
+        {"messages": _turn_with_tool_result(
+            fixture, tool_name=CUSTODY_TOOL_NAME,
+            arguments={**_arguments_for(CUSTODY_TOOL_NAME), "decedentQuery": " raw-query-token "},
+        )},
+        "session-custody", now=NOW, clerk_user_id="user-A",
+    )
+    card_event = events[1]
+    assert card_event == {"type": "confirmation_card", "card": fixture, "session_id": "session-custody"}
+    assert all(secret not in repr(card_event) for secret in (
+        "raw-query-token", "Completed at receiving location", "custody-key", "clerk_user_id", "tenant", "token",
+    ))
+
+    request = {
+        "clerk_user_id": "user-A", "session_id": "session-custody", "command": "custody",
+        "card_fingerprint": card_fingerprint(fixture),
+        "case_candidate_ids": ["case_henderson"],
+        "location_candidate_ids": ["location_moon_city"],
+    }
+
+    class Session:
+        profile = "vault"
+        external_session_owner = "user-A"
+
+    expected = {
+        "decedentQuery": "raw-query-token", "destinationQuery": "Moon City Mortuary",
+        "custodyHandoffCompleted": True, "notes": "Completed at receiving location", "idempotencyKey": "custody-key",
+    }
+    assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=NOW_MS) == expected
+    for altered in (
+        {**request, "clerk_user_id": "user-B"}, {**request, "session_id": "other"},
+        {**request, "command": "return"}, {**request, "card_fingerprint": "0" * 64},
+        {**request, "case_candidate_ids": ["case-other"]},
+        {**request, "location_candidate_ids": ["location-other"]},
+        {**request, "candidate_ids": ["case_henderson"]},
+        {**request, "extra": True},
+    ):
+        assert confirmation_context_for_request(lambda _sid: Session(), altered, now_ms=NOW_MS) is None
+    assert confirmation_context_for_request(lambda _sid: Session(), request, now_ms=fixture["expiresAt"]) is None
+
+
+def test_custody_rejects_malformed_cards_arguments_and_mismatched_pairs():
+    fixture = json.loads(CUSTODY_FIXTURE_PATH.read_text())
+    location_candidate = fixture["locationCandidates"][0]
+    invalid_cards = (
+        {**fixture, "caseCandidates": []},
+        {**fixture, "locationCandidates": [{**location_candidate, "kind": "unknown"}]},
+        {**fixture, "locationCandidates": [{**location_candidate, "isRestricted": 1}]},
+        {**fixture, "caseCandidates": [fixture["caseCandidates"][0], fixture["caseCandidates"][0]]},
+        {**fixture, "locationCandidates": [location_candidate, location_candidate]},
+        {
+            **fixture,
+            "locationCandidates": [
+                {**location_candidate, "locationId": f"location-{index}"} for index in range(6)
+            ],
+        },
+        {**fixture, "locationCandidates": [{**location_candidate, "extra": "forbidden"}]},
+        {**fixture, "actor": "forbidden"},
+        {**fixture, "expiresAt": NOW_MS + 300_001},
+    )
+    for payload in invalid_cards:
+        assert confirmation_card_and_context_from_current_turn(
+            _turn_with_tool_result(payload, tool_name=CUSTODY_TOOL_NAME), now=NOW
+        ) == (None, None)
+    for arguments in (
+        {**_arguments_for(CUSTODY_TOOL_NAME), "custodyHandoffCompleted": False},
+        {**_arguments_for(CUSTODY_TOOL_NAME), "notes": "x" * 1001},
+        {**_arguments_for(CUSTODY_TOOL_NAME), "notes": " "},
+        {**_arguments_for(CUSTODY_TOOL_NAME), "actor": "forbidden"},
+        {**_arguments_for(CUSTODY_TOOL_NAME), "destinationQuery": " "},
+    ):
+        assert confirmation_card_and_context_from_current_turn(
+            _turn_with_tool_result(fixture, tool_name=CUSTODY_TOOL_NAME, arguments=arguments), now=NOW
+        ) == (None, None)
+    mismatched = _turn_with_tool_result(fixture, tool_name=CUSTODY_TOOL_NAME)
+    mismatched[6]["tool_call_id"] = "other-call"
+    assert confirmation_card_and_context_from_current_turn(mismatched, now=NOW) == (None, None)
 
 
 def test_actual_vault_mcp_pickup_structured_content_fixture_is_the_accepted_wire_shape():
